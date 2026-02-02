@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-
+from dinov3.new_train.dtch import SinkhornKnoppTeacher, DTCH_BALANCE
 from dinov3.distributed import get_process_subgroup, get_subgroup_size
 
 
@@ -17,49 +17,49 @@ def lossfunc(t, s, temp):  # noqa: F811
     return torch.sum(t.float() * F.log_softmax(s.float() / temp, dim=-1), dim=-1)
 
 
-class SinkhornKnoppTeacher(nn.Module):
-    """
-    NOTE: This is a module and not a function in the `iBOTPatchLoss` class
-    This is because we want to torch.compile it, and torch.compil-ing a single
-    function with the `@torch.compile` decorator is bad.
-    It's better to `module.compile()` it, as we can control when we enable or
-    disable compilation globally.
-    """
+# class SinkhornKnoppTeacher(nn.Module):
+#     """
+#     NOTE: This is a module and not a function in the `iBOTPatchLoss` class
+#     This is because we want to torch.compile it, and torch.compil-ing a single
+#     function with the `@torch.compile` decorator is bad.
+#     It's better to `module.compile()` it, as we can control when we enable or
+#     disable compilation globally.
+#     """
 
-    @torch.no_grad()
-    def forward(self, teacher_output, teacher_temp, n_masked_patches_tensor, n_iterations=3):
-        teacher_output = teacher_output.float()
-        # world_size = dist.get_world_size() if dist.is_initialized() else 1
-        Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
-        # B = Q.shape[1] * world_size # number of samples to assign
-        B = n_masked_patches_tensor
-        dist.all_reduce(B, group=get_process_subgroup())
-        K = Q.shape[0]  # how many prototypes
+#     @torch.no_grad()
+#     def forward(self, teacher_output, teacher_temp, n_masked_patches_tensor, n_iterations=3):
+#         teacher_output = teacher_output.float()
+#         # world_size = dist.get_world_size() if dist.is_initialized() else 1
+#         Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
+#         # B = Q.shape[1] * world_size # number of samples to assign
+#         B = n_masked_patches_tensor
+#         dist.all_reduce(B, group=get_process_subgroup())
+#         K = Q.shape[0]  # how many prototypes
 
-        # make the matrix sums to 1
-        sum_Q = torch.sum(Q)
-        if dist.is_initialized():
-            dist.all_reduce(sum_Q, group=get_process_subgroup())
-        Q /= sum_Q
+#         # make the matrix sums to 1
+#         sum_Q = torch.sum(Q)
+#         if dist.is_initialized():
+#             dist.all_reduce(sum_Q, group=get_process_subgroup())
+#         Q /= sum_Q
 
-        for _ in range(n_iterations):
-            # normalize each row: total weight per prototype must be 1/K
-            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
-            if dist.is_initialized():
-                dist.all_reduce(sum_of_rows, group=get_process_subgroup())
-            Q /= sum_of_rows
-            Q /= K
+#         for _ in range(n_iterations):
+#             # normalize each row: total weight per prototype must be 1/K
+#             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+#             if dist.is_initialized():
+#                 dist.all_reduce(sum_of_rows, group=get_process_subgroup())
+#             Q /= sum_of_rows
+#             Q /= K
 
-            # normalize each column: total weight per sample must be 1/B
-            Q /= torch.sum(Q, dim=0, keepdim=True)
-            Q /= B
+#             # normalize each column: total weight per sample must be 1/B
+#             Q /= torch.sum(Q, dim=0, keepdim=True)
+#             Q /= B
 
-        Q *= B  # the colomns must sum to 1 so that Q is an assignment
-        return Q.t()
+#         Q *= B  # the colomns must sum to 1 so that Q is an assignment
+#         return Q.t()
 
 
 class iBOTPatchLoss(nn.Module):
-    def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9):
+    def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9, hist_cache=None):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
@@ -68,8 +68,12 @@ class iBOTPatchLoss(nn.Module):
         self.reduce_handle = None
         self.len_teacher_patch_tokens = None
         self.async_batch_center = None
-        self.sinkhorn_knopp_teacher = SinkhornKnoppTeacher()
-        self.sinkhorn_knopp_teacher.compile()
+        if hist_cache is not None:
+            self.sinkhorn_knopp_teacher = DTCH_BALANCE(K=patch_out_dim, history_cache_size=hist_cache)
+        else:
+            self.hist_cache = None
+        
+        # self.sinkhorn_knopp_teacher.compile()
 
     def init_weights(self) -> None:
         self.center.zero_()

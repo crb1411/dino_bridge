@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-
+from dinov3.new_train.dtch import SinkhornKnoppTeacher, DTCH_BALANCE
 from dinov3.distributed import get_process_subgroup, get_subgroup_size
 
 
@@ -19,6 +19,7 @@ class DINOLoss(nn.Module):
         out_dim,
         student_temp=0.1,
         center_momentum=0.9,
+        hist_cache=None
     ):
         super().__init__()
         self.student_temp = student_temp
@@ -28,6 +29,10 @@ class DINOLoss(nn.Module):
         self.reduce_handle = None
         self.len_teacher_output = None
         self.async_batch_center = None
+        if hist_cache is not None:
+            self.sinkhorn_knopp_teacher = DTCH_BALANCE(K=out_dim, history_cache_size=hist_cache)
+        else:
+            self.sinkhorn_knopp_teacher = DTCH_BALANCE(K=out_dim)
 
     def init_weights(self) -> None:
         self.center.zero_()
@@ -39,35 +44,35 @@ class DINOLoss(nn.Module):
         # teacher centering and sharpening
         return F.softmax((teacher_output - self.center) / teacher_temp, dim=-1)
 
-    @torch.no_grad()
-    def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_iterations=3):
-        # teacher_output: [batch, prototypes]
-        teacher_output = teacher_output.float()
-        world_size = get_subgroup_size() if dist.is_initialized() else 1
-        Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
-        B = Q.shape[1] * world_size  # number of samples to assign
-        K = Q.shape[0]  # how many prototypes
+    # @torch.no_grad()
+    # def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_iterations=3):
+    #     # teacher_output: [batch, prototypes]
+    #     teacher_output = teacher_output.float()
+    #     world_size = get_subgroup_size() if dist.is_initialized() else 1
+    #     Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
+    #     B = Q.shape[1] * world_size  # number of samples to assign
+    #     K = Q.shape[0]  # how many prototypes
 
-        # make the matrix sums to 1
-        sum_Q = torch.sum(Q)
-        if dist.is_initialized():
-            dist.all_reduce(sum_Q, group=get_process_subgroup())
-        Q /= sum_Q
+    #     # make the matrix sums to 1
+    #     sum_Q = torch.sum(Q)
+    #     if dist.is_initialized():
+    #         dist.all_reduce(sum_Q, group=get_process_subgroup())
+    #     Q /= sum_Q
 
-        for _ in range(n_iterations):
-            # normalize each row: total weight per prototype must be 1/K
-            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
-            if dist.is_initialized():
-                dist.all_reduce(sum_of_rows, group=get_process_subgroup())
-            Q /= sum_of_rows
-            Q /= K
+    #     for _ in range(n_iterations):
+    #         # normalize each row: total weight per prototype must be 1/K
+    #         sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+    #         if dist.is_initialized():
+    #             dist.all_reduce(sum_of_rows, group=get_process_subgroup())
+    #         Q /= sum_of_rows
+    #         Q /= K
 
-            # normalize each column: total weight per sample must be 1/B
-            Q /= torch.sum(Q, dim=0, keepdim=True)
-            Q /= B
+    #         # normalize each column: total weight per sample must be 1/B
+    #         Q /= torch.sum(Q, dim=0, keepdim=True)
+    #         Q /= B
 
-        Q *= B  # the colomns must sum to 1 so that Q is an assignment
-        return Q.t()
+    #     Q *= B  # the colomns must sum to 1 so that Q is an assignment
+    #     return Q.t()
 
     def forward(self, student_logits, teacher_probs, ignore_diagonal=False):
         """
