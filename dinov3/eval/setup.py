@@ -17,7 +17,7 @@ from dinov3.models import build_model_for_eval
 @dataclass
 class ModelConfig:
     # Loading a local file
-    config_file: str | None = None
+    config_file: str
     pretrained_weights: str | None = None
     # Loading a DINOv3 or v2 model from torch.hub
     dino_hub: str | None = None

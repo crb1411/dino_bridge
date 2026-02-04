@@ -76,23 +76,18 @@ def wrap_model(
 
 
 class ModelWithIntermediateLayers(nn.Module):
-    def __init__(self, feature_model, n, autocast_ctx, reshape=False, return_class_token=True):
+    def __init__(self, feature_model, n_last_blocks, autocast_ctx):
         super().__init__()
         self.feature_model = feature_model
         self.feature_model.eval()
-        self.n = n  # Layer indices (Sequence) or n last layers (int) to take
+        self.n_last_blocks = n_last_blocks
         self.autocast_ctx = autocast_ctx
-        self.reshape = reshape
-        self.return_class_token = return_class_token
 
     def forward(self, images):
         with torch.inference_mode():
             with self.autocast_ctx():
                 features = self.feature_model.get_intermediate_layers(
-                    images,
-                    n=self.n,
-                    reshape=self.reshape,
-                    return_class_token=self.return_class_token
+                    images, n=self.n_last_blocks, return_class_token=True
                 )
         return features
 
@@ -177,7 +172,7 @@ def extract_features(model, dataset, batch_size, num_workers, gather_on_cpu=Fals
     return extract_features_with_dataloader(model, data_loader, sample_count, gather_on_cpu)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def extract_features_with_dataloader(model, data_loader, sample_count, gather_on_cpu=False):
     gather_device = torch.device("cpu") if gather_on_cpu else torch.device("cuda")
     metric_logger = MetricLogger(delimiter="  ")

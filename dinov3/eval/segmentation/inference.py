@@ -6,9 +6,41 @@
 from typing import Callable, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torchvision.transforms import functional as Fv
+
+import dinov3.distributed as distributed
+
+
+def precompute_forward_number_for_sliding_inference(
+    test_dataloader,
+    dataset_len: int,
+    eval_crop_size: int,
+    eval_stride: int,
+):
+    image_crop_nums = torch.zeros(dataset_len, device=distributed.get_rank(), dtype=torch.int8)
+    print("Computing the number of forwards for sliding window evaluation")
+    for batch_img, target in test_dataloader:
+        # Dataset is wrapped in DatasetWithEnumeratedTargets
+        # and has index information
+        index, _ = target
+        # Only keep samples with non-negative indices
+        if index.item() < 0:
+            continue
+        batch_image_crops = []
+        for img in batch_img:
+            # Compute the number of crops to create (thus the number of forwards to do for each image)
+            h_stride, w_stride = eval_stride, eval_stride  # type: ignore
+            h_crop, w_crop = eval_crop_size, eval_crop_size  # type: ignore
+            h_img, w_img = img.shape[-2:]
+            h_grids = max(h_img - h_crop + h_stride - 1, 0) // h_stride + 1  # type: ignore
+            w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1  # type: ignore
+            batch_image_crops.append(h_grids * w_grids)  # number of crops
+        image_crop_nums[index.item()] = max(batch_image_crops)  # add information to the global tensor
+    dist.all_reduce(image_crop_nums, op=dist.ReduceOp.MAX)
+    return torch.max(image_crop_nums).item()
 
 
 def make_inference(
