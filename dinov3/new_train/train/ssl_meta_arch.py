@@ -433,6 +433,7 @@ class SSLMetaArch(nn.Module):
             mask_indices_list=mask_indices_list,
             masks_weight=masks_weight,
             iteration=iteration,
+            logger_freq=logger_freq,
         )
 
         self.backprop_loss(loss_accumulator)
@@ -445,7 +446,7 @@ class SSLMetaArch(nn.Module):
         self,
         images,
         it=0,
-        logger_freq=40,
+        logger_freq=0,
         *,
         upperbound,
         mask_indices_list,
@@ -613,7 +614,7 @@ class SSLMetaArch(nn.Module):
         mask_indices_list,
         masks_weight,
         iteration,
-        logger_freq=40,
+        logger_freq=0,
     ):
         n_global_crops = student_global["cls_after_head"].shape[0]
         n_local_crops = student_local["cls_after_head"].shape[0]
@@ -639,12 +640,17 @@ class SSLMetaArch(nn.Module):
             log_last_row_stats(
                 student_global["cls_after_head"].flatten(0, 1),
                 5,
-                "dino_local_student",
+                "dino_local_student_logits",
             )
             log_last_row_stats(
-                student_global["cls_after_head"].flatten(0, 1),
+                torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :], dim=0),
                 5,
-                "dino_local_teacher",
+                "dino_local_student_softmax",
+            )
+            log_last_row_stats(
+                teacher_global["cls_centered"].flatten(0, 1),
+                5,
+                "global_teacher_centered",
             )
         loss_dict["dino_local_crops_loss"] = dino_local_crops_loss
 
@@ -668,12 +674,17 @@ class SSLMetaArch(nn.Module):
             log_last_row_stats(
                 student_global["cls_after_head"].flatten(0, 1),
                 5,
-                "dino_global_student",
+                "dino_global_student_logits",
             )
             log_last_row_stats(
-                student_global["cls_after_head"].flatten(0, 1),
+                torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :], dim=0),
                 5,
-                "dino_global_teacher",
+                "dino_global_student_softmax",
+            )
+            log_last_row_stats(
+                teacher_global["cls_centered"].flatten(0, 1),
+                5,
+                "global_teacher_centered",
             )
         loss_dict["dino_global_crops_loss"] = dino_global_crops_loss
         loss_accumulator += self.dino_loss_weight * dino_global_scale * dino_global_crops_loss
@@ -694,14 +705,19 @@ class SSLMetaArch(nn.Module):
         if logger_freq > 0 and iteration % logger_freq == 0:
             logger.info(f"ibot_patch_loss: {ibot_patch_loss}")
             log_last_row_stats(
-                student_global["masked_patch_after_head"].flatten(0, 1),
+                student_global["masked_patch_after_head"],
                 5,
-                "ibot_student",
+                "ibot_student_logits",
             )
             log_last_row_stats(
-                student_global["masked_patch_after_head"].flatten(0, 1),
+                torch.softmax(student_global["masked_patch_after_head"][-1, :], dim=0),
                 5,
-                "ibot_teacher",
+                "ibot_student_softmax",
+            )
+            log_last_row_stats(
+                teacher_global["masked_patch_centered"].flatten(0, 1),
+                5,
+                "ibot_teacher_centered",
             )
         loss_dict["ibot_loss"] = ibot_patch_loss
         loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
@@ -824,6 +840,7 @@ class SSLMetaArch(nn.Module):
             lr_decay_rate=self.cfg.optim.layerwise_decay,
             patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult,
             dino_head_wd_multiplier=self.cfg.optim.dino_head_wd_multiplier,
+            dino_head_lr_multiplier=self.cfg.optim.dino_head_lr_multiplier,
         )
         if self.cfg.optim.multi_tensor_optim:
             fused_params_groups = fuse_params_groups(params_groups)
