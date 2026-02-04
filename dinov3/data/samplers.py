@@ -173,6 +173,7 @@ class ShardedInfiniteSampler(Sampler):
         step: Optional[int] = None,
         advance: int = 0,
         use_new_shuffle_tensor_slice: bool = False,
+        reshuffle_perm: bool = False,
     ):
         self._sample_count = sample_count
         self._seed = seed
@@ -181,6 +182,7 @@ class ShardedInfiniteSampler(Sampler):
         self._step = get_world_size() if step is None else step
         self._advance = advance
         self._iter_count = 0
+        self._reshuffle_perm = reshuffle_perm
         self._shuffle_tensor_slice_fn = (
             _new_shuffle_tensor_slice if use_new_shuffle_tensor_slice else _shuffle_tensor_slice
         )
@@ -211,10 +213,8 @@ class ShardedInfiniteSampler(Sampler):
         # Instantiate a generator here (rather than in the ctor) to be keep the class
         # picklable (requirement of mp.spawn)
         generator = torch.Generator()
-
-        # Always shuffle everything first
-        generator.manual_seed(self._seed)
         dtype = _get_torch_dtype(self._sample_count)
+        generator.manual_seed(self._seed)
         perm = torch.randperm(self._sample_count, dtype=dtype, generator=generator)
 
         while True:
@@ -227,3 +227,7 @@ class ShardedInfiniteSampler(Sampler):
             )
             yield from iterable
             self._iter_count += 1
+            if self._reshuffle_perm:
+                self._seed += 1
+                generator.manual_seed(self._seed)
+                perm = torch.randperm(self._sample_count, dtype=dtype, generator=generator)

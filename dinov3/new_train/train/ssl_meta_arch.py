@@ -643,7 +643,7 @@ class SSLMetaArch(nn.Module):
                 "dino_local_student_logits",
             )
             log_last_row_stats(
-                torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :], dim=0),
+                torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :]/0.1, dim=0),
                 5,
                 "dino_local_student_softmax",
             )
@@ -677,7 +677,7 @@ class SSLMetaArch(nn.Module):
                 "dino_global_student_logits",
             )
             log_last_row_stats(
-                torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :], dim=0),
+                torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :]/0.1, dim=0),
                 5,
                 "dino_global_student_softmax",
             )
@@ -710,12 +710,12 @@ class SSLMetaArch(nn.Module):
                 "ibot_student_logits",
             )
             log_last_row_stats(
-                torch.softmax(student_global["masked_patch_after_head"][-1, :], dim=0),
+                torch.softmax(student_global["masked_patch_after_head"][-1, :]/0.1, dim=0),
                 5,
                 "ibot_student_softmax",
             )
             log_last_row_stats(
-                teacher_global["masked_patch_centered"].flatten(0, 1),
+                teacher_global["masked_patch_centered"][-1, :],
                 5,
                 "ibot_teacher_centered",
             )

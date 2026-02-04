@@ -123,6 +123,7 @@ def _make_sampler(
     seed: int = 0,
     size: int = -1,
     advance: int = 0,
+    reshuffle_perm: bool = False,
 ) -> Optional[Sampler]:
     sample_count = len(dataset)
 
@@ -147,6 +148,7 @@ def _make_sampler(
             seed=seed,
             advance=advance,
             use_new_shuffle_tensor_slice=use_new_shuffle_tensor_slice,
+            reshuffle_perm=reshuffle_perm,
         )
     elif type == SamplerType.EPOCH:
         logger.info("sampler: epoch")

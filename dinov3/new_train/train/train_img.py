@@ -275,6 +275,7 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 
 
 def do_test(cfg, model, iteration, process_group, do_low_freq=False):
+    save_student = bool(getattr(cfg.checkpointing, "save_student", False))
     # dump a sharded checkpoint
     eval_dir = Path(cfg.train.output_dir) / "eval" / str(iteration)
     if distributed.is_subgroup_main_process():
@@ -288,6 +289,18 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         save_checkpoint(
             ckpt_dir=ckpt_path, iteration=iteration, model=teacher_backbone, overwrite=True, process_group=process_group
         )
+        if save_student:
+            student_ckpt_path = eval_dir / "sharded_student_checkpoint"
+            if distributed.is_subgroup_main_process():
+                student_ckpt_path.mkdir(parents=True, exist_ok=True)
+            torch.distributed.barrier()
+            save_checkpoint(
+                ckpt_dir=student_ckpt_path,
+                iteration=iteration,
+                model=model.student,
+                overwrite=True,
+                process_group=process_group,
+            )
         if not distributed.is_subgroup_main_process():
             return
     else:
@@ -295,12 +308,22 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         for k, tensor in list(new_state_dict.items()):
             if isinstance(tensor, DTensor):
                 new_state_dict[k] = tensor.full_tensor()
+        student_state_dict = None
+        if save_student:
+            student_state_dict = model.student.state_dict()
+            for k, tensor in list(student_state_dict.items()):
+                if isinstance(tensor, DTensor):
+                    student_state_dict[k] = tensor.full_tensor()
         if not distributed.is_subgroup_main_process():
             return
         # save teacher checkpoint
         ckpt_path = eval_dir / "teacher_checkpoint.pth"
         torch.save({"teacher": new_state_dict}, ckpt_path)
         logger.info("Saved eval checkpoint: %s", ckpt_path)
+        if save_student:
+            student_ckpt_path = eval_dir / "student_checkpoint.pth"
+            torch.save({"student": student_state_dict}, student_ckpt_path)
+            logger.info("Saved eval student checkpoint: %s", student_ckpt_path)
 
 def build_dataset_from_cfg_wsi(
     cfg,
@@ -399,6 +422,7 @@ def build_CombinedDataset_loader(cfg, start_iter=0):
         )
     logger.info(f"Use datasets: \n{info_str}")
     seed_num = 0
+    reshuffle_perm = bool(getattr(cfg.train, "reshuffle_sampler_perm", False))
     for ds, ratio in zip(datasets, ratios):
         sampler_type = SamplerType.SHARDED_INFINITE_NEW
         sampler = _make_sampler(
@@ -407,6 +431,7 @@ def build_CombinedDataset_loader(cfg, start_iter=0):
             shuffle=True,
             seed=seed_num,
             advance=int(start_iter*cfg.train.batch_size_per_gpu*ratio),
+            reshuffle_perm=reshuffle_perm,
         )
         seed_num += 1
         samplers.append(sampler)

@@ -50,6 +50,7 @@ train:
   cache_dataset: true
   use_teacher_head: true
   learn_from_teacher_tokens: false
+  reshuffle_sampler_perm: false
   centering: sinkhorn_knopp
   checkpointing: true
   checkpointing_full: false
@@ -149,6 +150,7 @@ checkpointing:
   period: 1000
   max_to_keep: 10
   keep_every: 50000
+  save_student: false
 schedules:
   lr:
     start: 0
@@ -175,3 +177,7 @@ data:
   imagenet_1k:
     txt_path: /root/data/imagenet_1k/data_new/imagenet_1k.txt
     dataset_ratio: 1.0
+dtch:
+  enabled: true
+  patch_hist_cache: 20000
+  cls_hist_cache: 20000

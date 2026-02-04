@@ -81,6 +81,7 @@ train:
   cudagraphs: false
   sharded_eval_checkpoint: false
   cache_dataset: false
+  reshuffle_sampler_perm: false
 student:
   arch: vit_large
   patch_size: 16
@@ -181,6 +182,7 @@ checkpointing:
   period: 3750
   max_to_keep: 3
   keep_every: 99999999999999999  # Save a checkpoint every N iterations, regardless of max_to_keep and period
+  save_student: false
 
 # Example of constant schedules with schedules v2
 # # schedules:
