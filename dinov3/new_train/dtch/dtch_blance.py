@@ -148,7 +148,7 @@ class DTCH_BALANCE(nn.Module):
         super().__init__()
         self.K = K
         self.history_cache_size = history_cache_size
-        self.register_buffer("history_Q", torch.full((K,), float("nan")))
+        self.register_buffer("history_Q", torch.full((K,), float("nan"), dtype=torch.float64))
         self.register_buffer("history_batch", torch.tensor(0, dtype=torch.long))
         self.argmax_count_soft = None
         self.argmax_count_sharp = None
@@ -508,7 +508,7 @@ class DTCH_BALANCE(nn.Module):
             self._history_cache_size_eff = cache_size_eff
             self._history_cache_capacity = cache_capacity
             if not self._history_Q_initialized:
-                self.history_Q = cache.sum(dim=0)
+                self.history_Q = cache.sum(dim=0, dtype=self.history_Q.dtype)
                 self._history_Q_initialized = True
 
         if _is_main_process():
@@ -760,8 +760,9 @@ class DTCH_BALANCE(nn.Module):
             f"(b_local={b_local} cap={capacity} eff={eff_size})"
         )
         sum_Q_local = torch.sum(Q_local, dim=1)
+        sum_Q_local_f64 = sum_Q_local.to(dtype=self.history_Q.dtype)
         scale = self._history_scale(b_local)
-        self.history_Q = sum_Q_local * (scale / b_local)
+        self.history_Q = sum_Q_local_f64 * (scale / b_local)
         self._history_Q_initialized = True
         cache = self.history_Q.to(device=device, dtype=dtype).unsqueeze(0).repeat(capacity, 1)
         cache = cache / capacity
@@ -787,12 +788,13 @@ class DTCH_BALANCE(nn.Module):
                 self._history_batch_from_ckpt = None
             if not self._history_Q_initialized:
                 sum_Q_local = torch.sum(Q_local, dim=1)
+                sum_Q_local_f64 = sum_Q_local.to(dtype=self.history_Q.dtype)
                 scale = self._history_scale(b_local)
                 self._log_history_init(
                     f"[CHSK-BALANCE][init] history from batch "
                     f"(b_local={b_local} scale={scale})"
                 )
-                self.history_Q = sum_Q_local * (scale / b_local)
+                self.history_Q = sum_Q_local_f64 * (scale / b_local)
                 self._history_Q_initialized = True
             self.history_batch.fill_(b_local)
             return
@@ -822,24 +824,21 @@ class DTCH_BALANCE(nn.Module):
             self._ensure_history_Q(Q_local)
             _, b_local = Q_local.shape
             sum_Q_local = torch.sum(Q_local, dim=1)
+            sum_Q_local_f64 = sum_Q_local.to(dtype=self.history_Q.dtype)
             scale = self._history_scale(b_local)
-            self.history_Q = ((scale - b_local) / scale) * self.history_Q + sum_Q_local
+            self.history_Q = ((scale - b_local) / scale) * self.history_Q + sum_Q_local_f64
             return
         self._ensure_history_Q(Q_local)
         sum_Q_local = torch.sum(Q_local, dim=1)
+        sum_Q_local_f64 = sum_Q_local.to(dtype=self.history_Q.dtype)
         if self._history_cache is None or self._history_cache_capacity <= 0:
-            self.history_Q = sum_Q_local
+            self.history_Q = sum_Q_local_f64
             return
-        if (
-            self._history_cache.device != self.history_Q.device
-            or self._history_cache.dtype != self.history_Q.dtype
-        ):
-            self._history_cache = self._history_cache.to(
-                device=self.history_Q.device, dtype=self.history_Q.dtype
-            )
+        if self._history_cache.device != self.history_Q.device:
+            self._history_cache = self._history_cache.to(device=self.history_Q.device)
         pos = self._history_cache_pos
-        old = self._history_cache[pos]
-        self.history_Q = self.history_Q - old + sum_Q_local
+        old = self._history_cache[pos].to(dtype=self.history_Q.dtype)
+        self.history_Q = self.history_Q - old + sum_Q_local_f64
         self._history_cache[pos] = sum_Q_local
         self._history_cache_pos = (pos + 1) % self._history_cache_capacity
 
