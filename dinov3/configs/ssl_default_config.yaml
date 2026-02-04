@@ -140,6 +140,7 @@ optim:
   scaling_rule: sqrt_wrt_1024
   patch_embed_lr_mult: 0.2
   dino_head_wd_multiplier: 1.0
+  dino_head_lr_multiplier: 1.0
   layerwise_decay: 0.9
   multi_tensor_optim: true
   dump_fsdp_weights_path: ""
