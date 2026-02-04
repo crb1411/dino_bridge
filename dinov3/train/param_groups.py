@@ -53,7 +53,13 @@ def get_vit_lr_decay_rate(
     return lr_decay_rate ** (num_layers + 1 - layer_id)
 
 
-def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0, dino_head_wd_multiplier=1.0):
+def get_params_groups_with_decay(
+    model,
+    lr_decay_rate=1.0,
+    patch_embed_lr_mult=1.0,
+    dino_head_wd_multiplier=1.0,
+    dino_head_lr_multiplier=1.0,
+):
     chunked_blocks = False
     if hasattr(model, "n_blocks"):
         logger.info("chunked fsdp")
@@ -91,6 +97,7 @@ def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1
 
         if "dino_head" in name:
             d["wd_multiplier"] = dino_head_wd_multiplier
+            d["lr_multiplier"] *= dino_head_lr_multiplier
 
         if "last_layer" in name:
             d["is_last_layer"] = True
@@ -122,7 +129,13 @@ def fuse_params_groups(all_params_groups, keys=("lr_multiplier", "wd_multiplier"
     return fused_params_groups.values()
 
 
-def get_params_groups_with_decay_fsdp(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0, dino_head_wd_multiplier=1.0):
+def get_params_groups_with_decay_fsdp(
+    model,
+    lr_decay_rate=1.0,
+    patch_embed_lr_mult=1.0,
+    dino_head_wd_multiplier=1.0,
+    dino_head_lr_multiplier=1.0,
+):
     if hasattr(model, "module"):  # SimpleFSDP
         is_backbone = hasattr(model.module, "blocks")
         n_blocks = len(model.module.blocks) if is_backbone else 0
@@ -153,6 +166,7 @@ def get_params_groups_with_decay_fsdp(model, lr_decay_rate=1.0, patch_embed_lr_m
 
         if "dino_head" in name:
             d["wd_multiplier"] = dino_head_wd_multiplier
+            d["lr_multiplier"] *= dino_head_lr_multiplier
 
         if "last_layer" in name:
             d["is_last_layer"] = True

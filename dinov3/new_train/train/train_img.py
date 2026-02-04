@@ -332,6 +332,7 @@ def build_dataset_from_cfg_wsi(
             target_transform=None,
         )
     elif dataset_type==DatasetType.IMGNET_DATA_2:
+        logger.info(f'Loading ImageNet dataset from {cfg.data.imagenet_1k.txt_path}')
         dataset = ImageNetResizeDataset(
             image_list_txt=cfg.data.imagenet_1k.txt_path,
             dataset_ratio=cfg.data.imagenet_1k.dataset_ratio,
@@ -632,7 +633,7 @@ def do_train(cfg, model, resume=False):
         
         # Checkpointing
         if (iteration + 1) % cfg.checkpointing.period == 0:
-            do_test(cfg, model, f"training_{iteration}", process_group=process_subgroup)
+            do_test(cfg, model, iteration, process_group=process_subgroup)
             synchronize(device_type)
             save_checkpoint(
                 ckpt_dir / str(iteration),

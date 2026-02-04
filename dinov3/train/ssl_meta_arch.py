@@ -766,6 +766,7 @@ class SSLMetaArch(nn.Module):
             lr_decay_rate=self.cfg.optim.layerwise_decay,
             patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult,
             dino_head_wd_multiplier=self.cfg.optim.dino_head_wd_multiplier,
+            dino_head_lr_multiplier=self.cfg.optim.dino_head_lr_multiplier,
         )
         if self.cfg.optim.multi_tensor_optim:
             fused_params_groups = fuse_params_groups(params_groups)
