@@ -88,8 +88,17 @@ class SSLMetaArch(nn.Module):
         )
 
         logger.info("OPTIONS -- KOLEO")
-        logger.info(f"OPTIONS -- KOLEO -- loss_weight: {cfg.dino.koleo_loss_weight}")
         logger.info(f"OPTIONS -- KOLEO -- distributed: {cfg.dino.koleo_loss_distributed}")
+        base_gate_threshold = getattr(cfg.dino, "koleo_gate_threshold", 0.0)
+        koleo_gate_threshold_cls = float(getattr(cfg.dino, "koleo_cls_gate_threshold", base_gate_threshold))
+        koleo_gate_threshold_patch = float(getattr(cfg.dino, "koleo_patch_gate_threshold", base_gate_threshold))
+        koleo_gate_enabled_cls = bool(getattr(cfg.dino, "koleo_cls_gate_enabled", False))
+        koleo_gate_enabled_patch = bool(getattr(cfg.dino, "koleo_patch_gate_enabled", False))
+        logger.info(f"OPTIONS -- KOLEO -- cls_gate_threshold: {koleo_gate_threshold_cls}")
+        logger.info(f"OPTIONS -- KOLEO -- cls_gate_enabled: {koleo_gate_enabled_cls}")
+        logger.info(f"OPTIONS -- KOLEO -- patch_gate_threshold: {koleo_gate_threshold_patch}")
+        logger.info(f"OPTIONS -- KOLEO -- patch_gate_enabled: {koleo_gate_enabled_patch}")
+
         if cfg.dino.koleo_loss_distributed:
             logger.info(f"OPTIONS -- KOLEO -- topk: {cfg.dino.koleo_topk}")
             logger.info(
@@ -98,13 +107,31 @@ class SSLMetaArch(nn.Module):
             assert cfg.dino.koleo_distributed_replicas == 0, (
                 "Option `dino.koleo_distributed_replicas` is no longer supported"
             )
-            self.koleo_loss = KoLeoLossDistributed(
-                topk=cfg.dino.koleo_topk,
-                loss_group_size=cfg.dino.koleo_distributed_loss_group_size,
-            )
+            def _build_koleo_loss(gate_threshold, gate_enabled):
+                return KoLeoLossDistributed(
+                    topk=cfg.dino.koleo_topk,
+                    loss_group_size=cfg.dino.koleo_distributed_loss_group_size,
+                    gate_threshold=gate_threshold,
+                    gate_enabled=gate_enabled,
+                )
         else:
             assert cfg.dino.koleo_topk == 1, "Non-distributed KoLeo loss only supports `dino.koleo_topk=1`"
-            self.koleo_loss = KoLeoLoss()
+            def _build_koleo_loss(gate_threshold, gate_enabled):
+                return KoLeoLoss(gate_threshold=gate_threshold, gate_enabled=gate_enabled)
+
+        self.koleo_loss_cls = _build_koleo_loss(koleo_gate_threshold_cls, koleo_gate_enabled_cls)
+        self.koleo_loss_patch = _build_koleo_loss(koleo_gate_threshold_patch, koleo_gate_enabled_patch)
+
+        cls_weight_cfg = getattr(cfg.dino, "koleo_cls_loss_weight", None)
+        if cls_weight_cfg is None:
+            cls_weight_cfg = getattr(cfg.dino, "koleo_loss_weight", 0.0)
+        patch_weight_cfg = getattr(cfg.dino, "koleo_patch_loss_weight", None)
+        if patch_weight_cfg is None:
+            patch_weight_cfg = 0.0
+        self.koleo_cls_loss_weight = float(cls_weight_cfg)
+        self.koleo_patch_loss_weight = float(patch_weight_cfg)
+        logger.info(f"OPTIONS -- KOLEO -- cls_loss_weight: {self.koleo_cls_loss_weight}")
+        logger.info(f"OPTIONS -- KOLEO -- patch_loss_weight: {self.koleo_patch_loss_weight}")
 
         logger.info("OPTIONS -- IBOT")
         logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
@@ -153,7 +180,6 @@ class SSLMetaArch(nn.Module):
         self.is_distillation_enabled = self.cfg.distillation.enabled
         self.dino_global_ignore_diagonal = self.cfg.dino.global_ignore_diagonal
         self.dino_loss_weight = self.cfg.dino.loss_weight
-        self.dino_koleo_loss_weight = self.cfg.dino.koleo_loss_weight
         self.ibot_loss_weight = self.cfg.ibot.loss_weight
 
         # Local loss reweighting
@@ -689,10 +715,32 @@ class SSLMetaArch(nn.Module):
         loss_dict["dino_global_crops_loss"] = dino_global_crops_loss
         loss_accumulator += self.dino_loss_weight * dino_global_scale * dino_global_crops_loss
 
-        # Koleo: regularize pre-head CLS tokens of student(global crops)
-        koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops
+        # Koleo: regularize pre-head CLS and patch tokens of student(global crops)
+        if self.koleo_cls_loss_weight > 0.0:
+            koleo_loss_cls = sum(self.koleo_loss_cls(x) for x in student_global["cls_pre_head"]) / n_global_crops
+        else:
+            koleo_loss_cls = student_global["cls_pre_head"][0].new_tensor(0.0)
+        loss_dict["koleo_loss_cls"] = koleo_loss_cls
+        loss_dict["koleo_loss_cls_weight"] = float(self.koleo_cls_loss_weight)
+
+        if self.koleo_patch_loss_weight > 0.0:
+            cls_tokens_flat = student_global["cls_pre_head"].flatten(0, 1)
+            if self.koleo_loss_patch.chunk_size is None and cls_tokens_flat.shape[0] > 0:
+                self.koleo_loss_patch.chunk_size = int(cls_tokens_flat.shape[0])
+
+            patch_tokens = student_global["patch_pre_head"].flatten(0, 1)  # [n_global_crops * B, P, D]
+            patch_tokens = patch_tokens[~masks] if masks is not None else patch_tokens.flatten(0, 1)
+            koleo_loss_patch = self.koleo_loss_patch(patch_tokens, shuffle=True)
+        else:
+            koleo_loss_patch = koleo_loss_cls.new_tensor(0.0)
+
+        loss_dict["koleo_loss_patch"] = koleo_loss_patch
+        loss_dict["koleo_loss_patch_weight"] = float(self.koleo_patch_loss_weight)
+        koleo_loss = (
+            self.koleo_cls_loss_weight * koleo_loss_cls + self.koleo_patch_loss_weight * koleo_loss_patch
+        )
         loss_dict["koleo_loss"] = koleo_loss
-        loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
+        loss_accumulator += koleo_scale * koleo_loss
 
         # IBOT loss
         ibot_patch_loss = self.ibot_patch_loss.forward_masked(

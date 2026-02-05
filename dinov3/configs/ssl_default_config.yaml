@@ -15,12 +15,17 @@ dino:
   head_norm_last_layer: false
   head_nlayers: 3
   head_hidden_dim: 2048
-  koleo_loss_weight: 0.1
+  koleo_cls_loss_weight: 0.1
+  koleo_patch_loss_weight: 0.0
   koleo_loss_distributed: false
   koleo_topk: 1
   koleo_distributed_replicas: 0
   koleo_distributed_loss_group_size: null  # Size of the nearest neighbor set for distributed Koleo. If None, uses global batch size.
   koleo_distributed_loss_group_data: true # group data from adjacent ranks to make sure koleo is applied on the same data distribution
+  koleo_cls_gate_enabled: false
+  koleo_patch_gate_enabled: false
+  koleo_cls_gate_threshold: 0.0
+  koleo_patch_gate_threshold: 0.0
   force_weight_norm: false
   reweight_dino_local_loss: false # If true, reweighting of DINO loss
   local_loss_weight_schedule:  # Schedule for local loss weight, enabled if reweight_dino_local_loss is true

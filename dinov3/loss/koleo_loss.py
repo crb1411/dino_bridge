@@ -14,9 +14,19 @@ import dinov3.distributed as dist
 class KoLeoLoss(nn.Module):
     """Kozachenko-Leonenko entropic loss regularizer from Sablayrolles et al. - 2018 - Spreading vectors for similarity search"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        gate_threshold: float = 0.0,
+        gate_alpha: float = 0.1,
+        gate_enabled: bool | None = None,
+        chunk_size: int | None = None,
+    ):
         super().__init__()
         self.pdist = nn.PairwiseDistance(2, eps=1e-8)
+        self.gate_threshold = float(gate_threshold)
+        self.gate_alpha = float(gate_alpha)
+        self.gate_enabled = gate_enabled
+        self.chunk_size = chunk_size
 
     def pairwise_NNs_inner(self, x):
         """
@@ -30,7 +40,17 @@ class KoLeoLoss(nn.Module):
         _, indices = torch.max(dots, dim=1)  # max inner prod -> min distance
         return indices
 
-    def forward(self, student_output, eps=1e-8):
+    def _apply_gate(self, losses: torch.Tensor) -> torch.Tensor:
+        enabled = self.gate_enabled
+        if enabled is None:
+            enabled = self.gate_threshold > 0.0
+        if not enabled:
+            return losses.mean()
+        alpha = max(self.gate_alpha, 1e-6)
+        gate = torch.sigmoid((losses - self.gate_threshold) / alpha)
+        return (losses * gate).sum() / gate.sum().clamp_min(1.0)
+
+    def _loss_on_batch(self, student_output, eps=1e-8):
         """
         Args:
             student_output (BxD): backbone output of student
@@ -39,18 +59,62 @@ class KoLeoLoss(nn.Module):
             student_output = F.normalize(student_output, eps=eps, p=2, dim=-1)
             indices = self.pairwise_NNs_inner(student_output)
             distances = self.pdist(student_output, student_output[indices])  # BxD, BxD -> B
-            loss = -torch.log(distances + eps).mean()
+            losses = -torch.log(distances + eps)
+            loss = self._apply_gate(losses)
         return loss
+
+    def forward(self, student_output, eps=1e-8, chunk_size: int | None = None, shuffle: bool = True):
+        """
+        Args:
+            student_output (BxD): backbone output of student
+        """
+        if student_output.shape[0] < 2:
+            return student_output.new_tensor(0.0)
+
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        if chunk_size is None or chunk_size >= student_output.shape[0] or chunk_size <= 0:
+            return self._loss_on_batch(student_output, eps=eps)
+
+        if shuffle:
+            perm = torch.randperm(student_output.shape[0], device=student_output.device)
+            student_output = student_output[perm]
+
+        n_chunks = student_output.shape[0] // chunk_size
+        if n_chunks <= 0:
+            return student_output.new_tensor(0.0)
+        student_output = student_output[: n_chunks * chunk_size]
+        chunk_losses = []
+        for start in range(0, student_output.shape[0], chunk_size):
+            chunk = student_output[start : start + chunk_size]
+            if chunk.shape[0] < 2:
+                continue
+            chunk_losses.append(self._loss_on_batch(chunk, eps=eps))
+        if not chunk_losses:
+            return student_output.new_tensor(0.0)
+        return torch.stack(chunk_losses).mean()
 
 
 class KoLeoLossDistributed(nn.Module):
     """Kozachenko-Leonenko entropic loss regularizer from Sablayrolles et al. - 2018 - Spreading vectors for similarity search"""
 
-    def __init__(self, topk=1, loss_group_size: int | None = None):
+    def __init__(
+        self,
+        topk=1,
+        loss_group_size: int | None = None,
+        gate_threshold: float = 0.0,
+        gate_alpha: float = 0.1,
+        gate_enabled: bool | None = None,
+        chunk_size: int | None = None,
+    ):
         super().__init__()
         self.pdist = nn.PairwiseDistance(2, eps=1e-8)
         self.topk = topk
         self.loss_group_size = loss_group_size  # Size of the nearest neighbor set. If None, uses global batch size.
+        self.gate_threshold = float(gate_threshold)
+        self.gate_alpha = float(gate_alpha)
+        self.gate_enabled = gate_enabled
+        self.chunk_size = chunk_size
 
     def pairwise_NNs_inner(self, x, all_x, rank):
         """
@@ -64,7 +128,17 @@ class KoLeoLossDistributed(nn.Module):
         _, indices = torch.topk(dots, dim=1, k=self.topk)  # max inner prod -> min distance
         return indices
 
-    def forward(self, student_output, eps=1e-8):
+    def _apply_gate(self, losses: torch.Tensor) -> torch.Tensor:
+        enabled = self.gate_enabled
+        if enabled is None:
+            enabled = self.gate_threshold > 0.0
+        if not enabled:
+            return losses.mean()
+        alpha = max(self.gate_alpha, 1e-6)
+        gate = torch.sigmoid((losses - self.gate_threshold) / alpha)
+        return (losses * gate).sum() / gate.sum().clamp_min(1.0)
+
+    def _loss_on_batch(self, student_output, eps=1e-8):
         """
         Args:
             student_output (BxD): backbone output of student
@@ -107,7 +181,39 @@ class KoLeoLossDistributed(nn.Module):
             student_output_expanded = (
                 student_output.unsqueeze(1).repeat(1, self.topk, 1).flatten(0, 1)
             )  # (local_B * topk) x D
-            distances = self.pdist(student_output_expanded, all_student_outputs[indices].flatten(0, 1))  # BxD, BxD -> B
-            loss = -torch.log(distances.float() + eps).mean()
+            distances = self.pdist(student_output_expanded, all_student_outputs[indices].flatten(0, 1))
+            losses = -torch.log(distances.float() + eps)
+            loss = self._apply_gate(losses)
 
         return loss
+
+    def forward(self, student_output, eps=1e-8, chunk_size: int | None = None, shuffle: bool = False):
+        """
+        Args:
+            student_output (BxD): backbone output of student
+        """
+        if student_output.shape[0] < 2:
+            return student_output.new_tensor(0.0)
+
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        if chunk_size is None or chunk_size >= student_output.shape[0] or chunk_size <= 0:
+            return self._loss_on_batch(student_output, eps=eps)
+
+        if shuffle:
+            perm = torch.randperm(student_output.shape[0], device=student_output.device)
+            student_output = student_output[perm]
+
+        n_chunks = student_output.shape[0] // chunk_size
+        if n_chunks <= 0:
+            return student_output.new_tensor(0.0)
+        student_output = student_output[: n_chunks * chunk_size]
+        chunk_losses = []
+        for start in range(0, student_output.shape[0], chunk_size):
+            chunk = student_output[start : start + chunk_size]
+            if chunk.shape[0] < 2:
+                continue
+            chunk_losses.append(self._loss_on_batch(chunk, eps=eps))
+        if not chunk_losses:
+            return student_output.new_tensor(0.0)
+        return torch.stack(chunk_losses).mean()
