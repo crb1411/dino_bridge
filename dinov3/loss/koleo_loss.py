@@ -18,7 +18,7 @@ class KoLeoLoss(nn.Module):
         self,
         gate_threshold: float = 0.0,
         gate_alpha: float = 0.1,
-        gate_enabled: bool | None = None,
+        gate_enabled: bool | None = False,
         chunk_size: int | None = None,
     ):
         super().__init__()
@@ -42,8 +42,6 @@ class KoLeoLoss(nn.Module):
 
     def _apply_gate(self, losses: torch.Tensor) -> torch.Tensor:
         enabled = self.gate_enabled
-        if enabled is None:
-            enabled = self.gate_threshold > 0.0
         if not enabled:
             return losses.mean()
         alpha = max(self.gate_alpha, 1e-6)
