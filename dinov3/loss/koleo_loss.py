@@ -46,7 +46,9 @@ class KoLeoLoss(nn.Module):
             return losses.mean()
         alpha = max(self.gate_alpha, 1e-6)
         gate = torch.sigmoid((losses - self.gate_threshold) / alpha)
-        return (losses * gate).sum() / gate.sum().clamp_min(1.0)
+        weighted_mean = (losses * gate).mean()
+        gated_mean = (losses * gate).sum() / gate.sum().clamp_min(1.0)
+        return 0.5 * weighted_mean + 0.5 * gated_mean
 
     def _loss_on_batch(self, student_output, eps=1e-8):
         """
@@ -134,7 +136,9 @@ class KoLeoLossDistributed(nn.Module):
             return losses.mean()
         alpha = max(self.gate_alpha, 1e-6)
         gate = torch.sigmoid((losses - self.gate_threshold) / alpha)
-        return (losses * gate).sum() / gate.sum().clamp_min(1.0)
+        weighted_mean = (losses * gate).mean()
+        gated_mean = (losses * gate).sum() / gate.sum().clamp_min(1.0)
+        return 0.5 * weighted_mean + 0.5 * gated_mean
 
     def _loss_on_batch(self, student_output, eps=1e-8):
         """
