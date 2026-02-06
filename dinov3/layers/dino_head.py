@@ -3,6 +3,8 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
@@ -48,6 +50,25 @@ class DINOHead(nn.Module):
         if not no_last_layer:
             x = self.last_layer(x)
         return x
+
+
+@contextmanager
+def freeze_module(module: nn.Module):
+    requires_grad = [p.requires_grad for p in module.parameters()]
+    try:
+        for p in module.parameters():
+            p.requires_grad_(False)
+        yield module
+    finally:
+        for p, req in zip(module.parameters(), requires_grad):
+            p.requires_grad_(req)
+
+
+def frozen_dino_head_forward(dino_head: nn.Module, x: torch.Tensor, **kwargs):
+    if dino_head is None:
+        raise ValueError("dino_head is None")
+    with freeze_module(dino_head):
+        return dino_head(x, **kwargs)
 
 
 def _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, bias=True):

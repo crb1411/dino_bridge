@@ -16,7 +16,7 @@ from omegaconf import OmegaConf
 import torch.distributed
 from torch.distributed._tensor import DTensor
 from torch.distributed._shard.sharded_tensor import ShardedTensor
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).parents[3]
 sys.path.append(str(REPO_ROOT))
 
 from dinov3.new_train.data.svs_h5.new_h5_svs_dataset import WsiPatchDataset, make_data_loader_wsi
@@ -38,21 +38,25 @@ from dinov3.checkpointer import (
 from dinov3.new_train.data.multi_dataset import CombinedDataset, CombinedSampler, DatasetType
 from dinov3.configs import get_cfg_from_args, setup_config, setup_job, setup_multidistillation
 from dinov3.data import (
-    DataAugmentationDINO,
+    DataAugmentationDINO as BaseDataAugmentationDINO,
     MaskingGenerator,
     SamplerType,
-    collate_data_and_cast,
+    collate_data_and_cast as collate_data_and_cast_base,
     make_data_loader,
     make_dataset,
     _make_sampler,
     CombinedDataLoader,
 )
-# from dinov3.data.legacy_augment import AugmentSwitch
+from dinov3.data.augmentations_resize_shuffle import (
+    DataAugmentationDINO as ResizeShuffleDataAugmentationDINO,
+    collate_data_and_cast as collate_data_and_cast_resize_shuffle,
+)
+from dinov3.data.resize_shuffle import AugmentSwitch
 from dinov3.logging import MetricLogger, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.new_train.train.ssl_meta_arch import SSLMetaArch
-# from dinov3.new_train.train.ssl_crop_roll import SSLAugmentedCropRoll
+from dinov3.new_train.train.ssl_resize_shuffle import SSLResizeShuffle
 from dinov3.new_train.utils import get_device, synchronize
 import traceback
 
@@ -118,15 +122,37 @@ For python-based LazyConfig, use "path.key=value".
 def build_optimizer(cfg, params_groups):
     return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
+def _resolve_resize_shuffle_augmentor_switch(cfg):
+    switch_cfg = OmegaConf.select(cfg, "crops.resize_shuffle_augmentor_switch")
+    if switch_cfg is None:
+        return None
+    if isinstance(switch_cfg, AugmentSwitch):
+        return switch_cfg
+    if OmegaConf.is_config(switch_cfg):
+        switch_cfg = OmegaConf.to_container(switch_cfg, resolve=True)
+    if isinstance(switch_cfg, dict):
+        try:
+            return AugmentSwitch(**switch_cfg)
+        except Exception as exc:
+            logger.warning("Invalid resize_shuffle_augmentor_switch: %s (%s)", switch_cfg, exc)
+    return None
+
+
+def _use_resize_shuffle_augmentor(cfg):
+    use_flag = OmegaConf.select(cfg, "crops.use_resize_shuffle_augmentor")
+    if use_flag is not None:
+        return bool(use_flag)
+    if OmegaConf.select(cfg, "resize_shuffle_augmentor") is not None:
+        return True
+    meta_arch = OmegaConf.select(cfg, "MODEL.META_ARCHITECTURE")
+    return meta_arch == "SSLResizeShuffle"
+
+
 def get_augmention(cfg):
-    # if hasattr(cfg, 'legacy_augmentor'):
-    #     use_legacy_augmentor = True
-    # else:
-    #     use_legacy_augmentor = False
-    return DataAugmentationDINO(
-        cfg.crops.global_crops_scale,
-        cfg.crops.local_crops_scale,
-        cfg.crops.local_crops_number,
+    aug_kwargs = dict(
+        global_crops_scale=cfg.crops.global_crops_scale,
+        local_crops_scale=cfg.crops.local_crops_scale,
+        local_crops_number=cfg.crops.local_crops_number,
         global_crops_size=cfg.crops.global_crops_size,
         local_crops_size=cfg.crops.local_crops_size,
         gram_teacher_crops_size=cfg.crops.gram_teacher_crops_size,
@@ -137,6 +163,13 @@ def get_augmention(cfg):
         mean=cfg.crops.rgb_mean,
         std=cfg.crops.rgb_std,
     )
+    if _use_resize_shuffle_augmentor(cfg):
+        return ResizeShuffleDataAugmentationDINO(
+            **aug_kwargs,
+            use_resize_shuffle_augmentor=True,
+            resize_shuffle_augmentor_switch=_resolve_resize_shuffle_augmentor_switch(cfg),
+        )
+    return BaseDataAugmentationDINO(**aug_kwargs)
 
 def build_schedulers(cfg):
     if "schedules" in cfg:
@@ -389,8 +422,11 @@ def get_collate(cfg):
         max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
     )
     local_batch_size = None  # will default to the standard local batch size matching the data batch size
+    collate_impl = (
+        collate_data_and_cast_resize_shuffle if _use_resize_shuffle_augmentor(cfg) else collate_data_and_cast_base
+    )
     collate_fn = partial(
-        collate_data_and_cast,
+        collate_impl,
         mask_ratio_tuple=cfg.ibot.mask_ratio_min_max,
         mask_probability=cfg.ibot.mask_sample_probability,
         dtype={
@@ -571,7 +607,7 @@ def do_train(cfg, model, resume=False):
 
         # Forward backward
         optimizer.zero_grad(set_to_none=True)
-        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it, logger_freq=logger_freq*4)
+        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it, logger_freq=logger_freq*20)
         forward_backward_time = time.time() - start_train_time
 
         # Gradient clipping
@@ -716,6 +752,7 @@ def main(argv=None):
     meta_arch = {
         "SSLMetaArch": SSLMetaArch,
         "MultiDistillationMetaArch": MultiDistillationMetaArch,
+        "SSLResizeShuffle": SSLResizeShuffle,
     }.get(cfg.MODEL.META_ARCHITECTURE, None)
     if meta_arch is None:
         raise ValueError(f"Unknown MODEL.META_ARCHITECTURE {cfg.MODEL.META_ARCHITECTURE}")

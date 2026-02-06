@@ -177,6 +177,21 @@ crops:
   - 0.224
   - 0.225
   teacher_to_student_resolution_scale: 1.0
+  use_resize_shuffle_augmentor: false
+  resize_shuffle_augmentor_switch: null
+resize_shuffle_augmentor:
+  resize_paste_loss_weight: 0.0
+  patch_shuffle_loss_weight: 0.0
+  patch_shuffle_patch_weight: 1.0
+  patch_shuffle_cls_weight: 1.0
+  patch_shuffle_patch_probability: 1.0
+  patch_shuffle_patch_min_max:
+  - 0.0
+  - 0.0
+  use_all_shift_mask: true
+  bridge_patchshuffle_weight: 0.0
+  bridge_global_weight: 0.0
+  patch_size: 16
 evaluation:
   eval_period_iterations: 12500
   low_freq_every: 5

@@ -654,7 +654,6 @@ class SSLMetaArch(nn.Module):
         dino_local_terms = n_global_crops * n_local_crops
         dino_global_scale = dino_global_terms / (dino_global_terms + dino_local_terms)
         dino_local_scale = dino_local_terms / (dino_global_terms + dino_local_terms)
-        koleo_scale = n_global_crops
 
         # DINO local loss: compare post-head CLS tokens: student(local crops) vs. teacher(global crops)
         dino_local_crops_loss = self.dino_loss(
@@ -740,7 +739,9 @@ class SSLMetaArch(nn.Module):
             self.koleo_cls_loss_weight * koleo_loss_cls + self.koleo_patch_loss_weight * koleo_loss_patch
         )
         loss_dict["koleo_loss"] = koleo_loss
-        loss_accumulator += koleo_scale * koleo_loss
+        loss_accumulator += (
+            self.koleo_cls_loss_weight * koleo_loss_cls + self.koleo_patch_loss_weight * koleo_loss_patch
+        )
 
         # IBOT loss
         ibot_patch_loss = self.ibot_patch_loss.forward_masked(

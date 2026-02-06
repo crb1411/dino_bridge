@@ -82,8 +82,14 @@ class SSLMetaArch(nn.Module):
         self.dino_loss = DINOLoss(self.dino_out_dim)
 
         logger.info("OPTIONS -- KOLEO")
-        logger.info(f"OPTIONS -- KOLEO -- loss_weight: {cfg.dino.koleo_loss_weight}")
+        koleo_loss_weight = float(
+            getattr(cfg.dino, "koleo_cls_loss_weight", getattr(cfg.dino, "koleo_loss_weight", 0.0))
+        )
+        logger.info(f"OPTIONS -- KOLEO -- loss_weight: {koleo_loss_weight}")
         logger.info(f"OPTIONS -- KOLEO -- distributed: {cfg.dino.koleo_loss_distributed}")
+        base_gate_threshold = getattr(cfg.dino, "koleo_gate_threshold", 0.0)
+        gate_threshold = float(getattr(cfg.dino, "koleo_cls_gate_threshold", base_gate_threshold))
+        gate_enabled = bool(getattr(cfg.dino, "koleo_cls_gate_enabled", False))
         if cfg.dino.koleo_loss_distributed:
             logger.info(f"OPTIONS -- KOLEO -- topk: {cfg.dino.koleo_topk}")
             logger.info(
@@ -95,10 +101,12 @@ class SSLMetaArch(nn.Module):
             self.koleo_loss = KoLeoLossDistributed(
                 topk=cfg.dino.koleo_topk,
                 loss_group_size=cfg.dino.koleo_distributed_loss_group_size,
+                gate_threshold=gate_threshold,
+                gate_enabled=gate_enabled,
             )
         else:
             assert cfg.dino.koleo_topk == 1, "Non-distributed KoLeo loss only supports `dino.koleo_topk=1`"
-            self.koleo_loss = KoLeoLoss()
+            self.koleo_loss = KoLeoLoss(gate_threshold=gate_threshold, gate_enabled=gate_enabled)
 
         logger.info("OPTIONS -- IBOT")
         logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
@@ -143,7 +151,7 @@ class SSLMetaArch(nn.Module):
         self.is_distillation_enabled = self.cfg.distillation.enabled
         self.dino_global_ignore_diagonal = self.cfg.dino.global_ignore_diagonal
         self.dino_loss_weight = self.cfg.dino.loss_weight
-        self.dino_koleo_loss_weight = self.cfg.dino.koleo_loss_weight
+        self.dino_koleo_loss_weight = koleo_loss_weight
         self.ibot_loss_weight = self.cfg.ibot.loss_weight
 
         # Local loss reweighting
@@ -605,7 +613,6 @@ class SSLMetaArch(nn.Module):
         dino_local_terms = n_global_crops * n_local_crops
         dino_global_scale = dino_global_terms / (dino_global_terms + dino_local_terms)
         dino_local_scale = dino_local_terms / (dino_global_terms + dino_local_terms)
-        koleo_scale = n_global_crops
 
         # DINO local loss: compare post-head CLS tokens: student(local crops) vs. teacher(global crops)
         dino_local_crops_loss = self.dino_loss(
@@ -635,7 +642,7 @@ class SSLMetaArch(nn.Module):
         # Koleo: regularize pre-head CLS tokens of student(global crops)
         koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops
         loss_dict["koleo_loss"] = koleo_loss
-        loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
+        loss_accumulator += self.dino_koleo_loss_weight * koleo_loss
 
         # IBOT loss
         ibot_patch_loss = self.ibot_patch_loss.forward_masked(
