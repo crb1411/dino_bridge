@@ -22,6 +22,7 @@ from dinov3.eval.helpers import write_results
 from dinov3.eval.knn import DictKeysModule, _log_and_format_results_dict
 from dinov3.eval.metrics import ClassificationMetricType, build_classification_metric
 from dinov3.eval.utils import evaluate
+from dinov3.new_train.utils.auto_device import get_device
 
 logger = logging.getLogger("dinov3.knn_features")
 
@@ -42,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ks", default="10,20,100,200", help="Comma/space separated k values")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--metric", default="mean_accuracy")
-    parser.add_argument("--device", default="cuda", help="cuda or cpu")
+    parser.add_argument("--device", default="auto", help="auto/cuda/npu/cpu")
     parser.add_argument("--train-chunk-size", type=int, default=0, help="Chunk size for train features (0 = full)")
     parser.add_argument("--skip-first-nn", action="store_true")
     parser.add_argument("--no-normalize", action="store_true")
@@ -231,9 +232,11 @@ def main() -> None:
     if not ks:
         raise ValueError("No valid k values after clipping to train set size")
 
-    device = torch.device(args.device)
+    device = get_device() if args.device == "auto" else torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested but not available")
+    if device.type == "npu" and (not hasattr(torch, "npu") or not torch.npu.is_available()):
+        raise RuntimeError("NPU device requested but not available")
 
     metric_type = parse_metric(args.metric)
     metric_collection = build_classification_metric(metric_type, num_classes=num_classes)

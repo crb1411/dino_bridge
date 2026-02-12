@@ -58,16 +58,16 @@ from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.new_train.train.ssl_meta_arch import SSLMetaArch
 from dinov3.new_train.train.ssl_resize_shuffle import SSLResizeShuffle
 from dinov3.new_train.utils import get_device, synchronize
-import traceback
 
 logger = logging.getLogger("dinov3")
 
 assert torch.__version__ >= (2, 1)
-try:
-    torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
-    torch.backends.cudnn.benchmark = False  # True
-except Exception as e:
-    traceback.print_exc(f"Error setting torch.backends.cuda.matmul.allow_tf32: {e}")
+if get_device().type == "cuda":
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
+        torch.backends.cudnn.benchmark = False  # True
+    except Exception as e:
+        logger.warning("Failed to configure CUDA backend flags: %s", e)
 
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv3 training", add_help=add_help)
@@ -355,7 +355,8 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         logger.info("Saved eval checkpoint: %s", ckpt_path)
         if save_student:
             student_ckpt_path = eval_dir / "student_checkpoint.pth"
-            torch.save({"student": student_state_dict}, student_ckpt_path)
+            # Keep "teacher" key for compatibility with eval loader, which defaults to checkpoint_key="teacher".
+            torch.save({"teacher": student_state_dict}, student_ckpt_path)
             logger.info("Saved eval student checkpoint: %s", student_ckpt_path)
 
 def build_dataset_from_cfg_wsi(
@@ -521,7 +522,7 @@ def do_train(cfg, model, resume=False):
     start_iter = 0
     if resume:
         logger.info(f"Checkpoint found {cfg.checkpoint_dir}")
-        model.to_empty(device=device_type.type)
+        model.to_empty(device=device_type)
         start_iter = (
             load_checkpoint(
                 cfg.checkpoint_dir,
@@ -634,7 +635,7 @@ def do_train(cfg, model, resume=False):
         )
         total_loss = total_loss_all_ranks.mean()
         metrics_values = torch.stack(
-            [torch.as_tensor(v, dtype=torch.float32, device=total_loss.device).detach() for v in metrics_dict.values()]
+            [torch.as_tensor(v, dtype=torch.float64, device=total_loss.device).detach() for v in metrics_dict.values()]
         )
         torch.distributed.all_reduce(
             metrics_values,

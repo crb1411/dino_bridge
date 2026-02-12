@@ -15,6 +15,8 @@ from typing import List, Sequence
 import torch
 import torch.distributed as dist
 
+from dinov3.new_train.utils.auto_device import get_device, get_distributed_backend, set_device_index
+
 logger = logging.getLogger("dinov3")
 
 _DEFAULT_PROCESS_GROUP = None
@@ -234,8 +236,8 @@ def enable_distributed(
     """Enable distributed mode.
 
     Args:
-        set_cuda_current_device: If True, call torch.cuda.set_device() to set the
-            current PyTorch CUDA device to the one matching the local rank.
+        set_cuda_current_device: If True, set the current accelerator device index
+            to match the local rank.
         overwrite: If True, overwrites already set variables. Else fails.
         nccl_async_error_handling: Enables NCCL asynchronous error handling. As a
             side effect, this enables timing out PyTorch distributed operations
@@ -251,18 +253,22 @@ def enable_distributed(
     if _DEFAULT_PROCESS_GROUP is not None:
         raise RuntimeError("Distributed mode has already been enabled")
 
+    runtime_device = get_device()
+    dist_backend = get_distributed_backend(runtime_device)
+
     torch_env = TorchDistributedEnvironment()
     logger.info(f"PyTorch distributed environment: {torch_env}")
     torch_env.export(
         overwrite=overwrite,
-        nccl_async_error_handling=nccl_async_error_handling,
+        nccl_async_error_handling=nccl_async_error_handling and dist_backend == "nccl",
     )
 
     if set_cuda_current_device:
-        torch.cuda.set_device(torch_env.local_rank)
+        set_device_index(torch_env.local_rank)
 
-    dist.init_process_group(backend="nccl", timeout=timeout)
+    dist.init_process_group(backend=dist_backend, timeout=timeout)
     dist.barrier()
+    logger.info("Initialized distributed backend=%s on device=%s", dist_backend, runtime_device.type)
 
     if restrict_print_to_main_process:
         _restrict_print_to_main_process()

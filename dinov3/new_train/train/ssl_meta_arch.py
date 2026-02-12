@@ -22,7 +22,7 @@ from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
-from dinov3.new_train.utils import log_last_row_stats
+from dinov3.new_train.utils import empty_cache, get_device, log_last_row_stats
 
 logger = logging.getLogger("dinov3")
 
@@ -45,13 +45,14 @@ class SSLMetaArch(nn.Module):
         assert cfg.compute_precision.sharding_strategy == "SHARD_GRAD_OP"
 
         self.cfg = cfg
+        self.device = get_device()
 
         student_model_dict = dict()
         teacher_model_dict = dict()
         gram_model_dict = dict()
 
         student_backbone, teacher_backbone, embed_dim = build_model_from_cfg(cfg)
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
         gc.collect()
         gram_backbone, _ = build_model_from_cfg(cfg, only_teacher=True)
         logger.info(f"Number of parameters: {count_parameters(student_backbone)}")
@@ -402,18 +403,18 @@ class SSLMetaArch(nn.Module):
         metrics_dict["local_batch_size"] = B
         metrics_dict["global_batch_size"] = data["global_batch_size"]
 
-        global_crops = data["collated_global_crops"].cuda(non_blocking=True)
-        local_crops = data["collated_local_crops"].cuda(non_blocking=True)
-        masks = data["collated_masks"].cuda(non_blocking=True)
-        mask_indices_list = data["mask_indices_list"].cuda(non_blocking=True)
-        masks_weight = data["masks_weight"].cuda(non_blocking=True)
-        n_masked_patches_tensor = data["n_masked_patches"].cuda(non_blocking=True)
+        global_crops = data["collated_global_crops"].to(device=self.device, non_blocking=True)
+        local_crops = data["collated_local_crops"].to(device=self.device, non_blocking=True)
+        masks = data["collated_masks"].to(device=self.device, non_blocking=True)
+        mask_indices_list = data["mask_indices_list"].to(device=self.device, non_blocking=True)
+        masks_weight = data["masks_weight"].to(device=self.device, non_blocking=True)
+        n_masked_patches_tensor = data["n_masked_patches"].to(device=self.device, non_blocking=True)
 
         if self.has_gram_teacher:
             assert "collated_gram_teacher_crops" in data, (
                 "no gram teacher crops in the data, have you set cfg.crops.gram_teacher_crops_size?"
             )
-            gram_teacher_crops = data["collated_gram_teacher_crops"].cuda(non_blocking=True)
+            gram_teacher_crops = data["collated_gram_teacher_crops"].to(device=self.device, non_blocking=True)
         else:
             gram_teacher_crops = None
 

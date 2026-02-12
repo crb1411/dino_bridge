@@ -16,6 +16,7 @@ from torch.distributed.fsdp import register_fsdp_forward_method
 from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
+from dinov3.new_train.utils.auto_device import get_device
 from dinov3.utils import utils
 
 
@@ -163,6 +164,9 @@ def ac_compile_parallelize(
     # 1/ AC on blocks
     if cfg.train.checkpointing:
         ARCH_TYPE_MAP[type(trained_model.backbone)]["activation_checkpointing_fn"](cfg, trained_model["backbone"])
+    runtime_device = get_device()
+    device_type = runtime_device.type
+    compile_enabled = bool(cfg.train.compile) and device_type == "cuda"
     # 2/ Compile blocks
     all_models = [trained_model] + inference_only_models
     if trained_model_process_group is None and inference_only_models_process_groups is None:
@@ -170,10 +174,12 @@ def ac_compile_parallelize(
     elif trained_model_process_group is None:
         all_pgs = [None] + inference_only_models_process_groups
     elif inference_only_models_process_groups is None:
-        all_pgs = [trained_model_process_group] + [None] * len(inference_only_models_process_groups)
+        all_pgs = [trained_model_process_group] + [None] * len(inference_only_models)
     else:
         all_pgs = [trained_model_process_group] + inference_only_models_process_groups
-    if cfg.train.compile:
+    if cfg.train.compile and not compile_enabled:
+        logger.info("torch.compile requested but skipped on device type '%s'", device_type)
+    if compile_enabled:
         for model in all_models:
             for k in model.keys():
                 if k == "backbone":
@@ -192,12 +198,12 @@ def ac_compile_parallelize(
     for model, pg in zip(all_models, all_pgs):
         if pg is None:
             world_mesh = init_device_mesh(
-                "cuda",
+                device_type,
                 mesh_shape=(dist.get_world_size(),),
                 mesh_dim_names=("dp",),
             )
         else:
-            world_mesh = DeviceMesh.from_group(pg, "cuda")
+            world_mesh = DeviceMesh.from_group(pg, device_type)
         fsdp_config = {"mesh": world_mesh, "mp_policy": mp_policy}
         for k in model.keys():
             if k == "backbone":
@@ -205,9 +211,9 @@ def ac_compile_parallelize(
             else:
                 model[k] = fully_shard(model[k], **fsdp_config, reshard_after_forward=True)
 
-    # 4/ Move to `cuda` device
+    # 4/ Move to runtime device
     for model in all_models:
-        model.to_empty(device="cuda")
+        model.to_empty(device=runtime_device)
 
     # 5/ FSDP2: Reshard immediately after forward for inference-only models
     for model in inference_only_models:

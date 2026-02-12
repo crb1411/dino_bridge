@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from dinov3.configs import DinoV3SetupArgs, setup_config
 from dinov3.models import build_model_for_eval
+from dinov3.new_train.utils.auto_device import get_device
 
 
 @dataclass
@@ -32,6 +33,7 @@ class BaseModelContext(TypedDict):
 
 
 def load_model_and_context(model_config: ModelConfig, output_dir: str) -> tuple[torch.nn.Module, BaseModelContext]:
+    runtime_device = get_device()
     if model_config.dino_hub is not None:
         assert model_config.pretrained_weights is None and model_config.config_file is None
         if "dinov3" in model_config.dino_hub:
@@ -49,7 +51,7 @@ def load_model_and_context(model_config: ModelConfig, output_dir: str) -> tuple[
             output_dir=output_dir,
         )
 
-    model.cuda()
+    model.to(runtime_device)
     model.eval()
     return model, base_model_context
 
@@ -70,7 +72,8 @@ def setup_and_build_model(
     opts: list | None = None,
     **ignored_kwargs,
 ) -> Tuple[nn.Module, BaseModelContext]:
-    cudnn.benchmark = True
+    if get_device().type == "cuda":
+        cudnn.benchmark = True
     del ignored_kwargs
     setup_args = DinoV3SetupArgs(
         config_file=config_file,

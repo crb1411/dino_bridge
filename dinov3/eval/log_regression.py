@@ -7,6 +7,7 @@ import logging
 import sys
 from pathlib import Path
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence
@@ -34,6 +35,7 @@ from dinov3.eval.metrics import ClassificationMetricType, build_classification_m
 from dinov3.eval.setup import ModelConfig, load_model_and_context
 from dinov3.eval.utils import average_metrics, evaluate, extract_features
 from dinov3.eval.utils import save_results as default_save_results_func
+from dinov3.new_train.utils.auto_device import empty_cache, get_device
 from dinov3.run.init import job_context
 from dinov3.utils.dtype import as_torch_dtype
 
@@ -148,12 +150,13 @@ class LogRegModule(nn.Module):
 def evaluate_logreg_model(*, logreg_model, test_metric, test_data_loader, save_results_func=None):
     key = "metrics"  # We need only one key as we have only one metric
     postprocessors, metrics = {key: logreg_model}, {key: test_metric}
+    runtime_device = get_device()
     _, eval_metrics, accumulated_results = evaluate(
         nn.Identity(),
         test_data_loader,
         postprocessors,
         metrics,
-        torch.cuda.current_device(),
+        runtime_device,
         accumulate_results=save_results_func is not None,
     )
     if save_results_func is not None:
@@ -380,7 +383,9 @@ def eval_log_regression_with_model(*, model: torch.nn.Module, autocast_dtype, co
     the best results on a random 10% subset of the train dataset
     """
     start = time.time()
-    cudnn.benchmark = True
+    runtime_device = get_device()
+    if runtime_device.type == "cuda":
+        cudnn.benchmark = True
 
     mean, std = _load_rgb_mean_std(config.model.config_file)
     if mean is not None and std is not None:
@@ -392,7 +397,13 @@ def eval_log_regression_with_model(*, model: torch.nn.Module, autocast_dtype, co
     train_dataset_dict, val_dataset, num_classes = make_train_val_datasets(config.train, config.few_shot, transform)
 
     # Extracting features
-    with torch.autocast("cuda", dtype=autocast_dtype):
+    autocast_ctx = nullcontext()
+    if runtime_device.type != "cpu":
+        try:
+            autocast_ctx = torch.autocast(runtime_device.type, dtype=autocast_dtype)
+        except Exception as exc:
+            logger.warning("autocast disabled for device=%s (%s)", runtime_device.type, exc)
+    with autocast_ctx:
         gather_on_cpu = torch.device(config.train.train_features_device) == _CPU_DEVICE
         train_data_dict: dict[int, dict[str, torch.Tensor]] = {}
         for try_n, dataset in train_dataset_dict.items():
@@ -437,7 +448,7 @@ def eval_log_regression_with_model(*, model: torch.nn.Module, autocast_dtype, co
 
     # Moves the model to cpu in-place. Deleting the variable would only delete a reference and not free any space.
     model.cpu()  # all features are extracted, we won't use the backbone anymore
-    torch.cuda.empty_cache()
+    empty_cache(runtime_device)
 
     if not config.run_eval:
         logger.info("Feature extraction completed; skipping log regression evaluation (run_eval=false).")

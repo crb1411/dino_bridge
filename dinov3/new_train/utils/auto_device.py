@@ -47,17 +47,43 @@ def set_device_index(local_rank: int | None = None) -> None:
     device = get_device()
     if device.type == "cuda" and local_rank is not None:
         torch.cuda.set_device(local_rank)
-    if device.type == "npu" and local_rank is not None:
+    if device.type == "npu" and hasattr(torch, "npu") and local_rank is not None:
         torch.npu.set_device(local_rank)
-    if device.type == "xpu" and local_rank is not None:
+    if device.type == "xpu" and hasattr(torch, "xpu") and local_rank is not None:
         torch.xpu.set_device(local_rank)
-    
-    
-def synchronize(device_type=torch.device('cuda')):
+
+
+def get_distributed_backend(device: torch.device | None = None) -> str:
+    if device is None:
+        device = get_device()
+
+    if device.type == "cuda":
+        return "nccl"
+    if device.type == "npu":
+        return "hccl"
+    if device.type in {"cpu", "mps", "xpu"}:
+        return "gloo"
+    return "gloo"
+
+
+def empty_cache(device: torch.device | None = None) -> None:
+    if device is None:
+        device = get_device()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "npu" and hasattr(torch, "npu"):
+        torch.npu.empty_cache()
+    elif device.type == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.empty_cache()
+
+
+def synchronize(device_type: torch.device | None = None):
+    if device_type is None:
+        device_type = get_device()
     if device_type.type == "cuda":
         torch.cuda.synchronize()
-    elif device_type.type == "npu":
+    elif device_type.type == "npu" and hasattr(torch, "npu"):
         torch.npu.synchronize()
-    elif device_type.type == "xpu":
+    elif device_type.type == "xpu" and hasattr(torch, "xpu"):
         torch.xpu.synchronize()
         

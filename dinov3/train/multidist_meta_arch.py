@@ -37,12 +37,12 @@ class MultiDistillationMetaArch(SSLMetaArch):
         assert data["collated_global_crops"].shape[0] == n_global_crops * B
         metrics_dict["batch_size"] = B
 
-        global_crops = data["collated_global_crops"].cuda(non_blocking=True)
-        local_crops = data["collated_local_crops"].cuda(non_blocking=True)
-        masks = data["collated_masks"].cuda(non_blocking=True)
-        mask_indices_list = data["mask_indices_list"].cuda(non_blocking=True)
-        masks_weight = data["masks_weight"].cuda(non_blocking=True)
-        n_masked_patches_tensor = data["n_masked_patches"].cuda(non_blocking=True)
+        global_crops = data["collated_global_crops"].to(device=self.device, non_blocking=True)
+        local_crops = data["collated_local_crops"].to(device=self.device, non_blocking=True)
+        masks = data["collated_masks"].to(device=self.device, non_blocking=True)
+        mask_indices_list = data["mask_indices_list"].to(device=self.device, non_blocking=True)
+        masks_weight = data["masks_weight"].to(device=self.device, non_blocking=True)
+        n_masked_patches_tensor = data["n_masked_patches"].to(device=self.device, non_blocking=True)
         global_batch_size = data["global_batch_size"]
 
         # Multidistillation codepath:

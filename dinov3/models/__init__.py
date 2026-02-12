@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from dinov3.layers.fp8_linear import convert_linears_to_fp8
+from dinov3.new_train.utils.auto_device import get_device
 
 from . import vision_transformer as vits
 from . import convnext
@@ -102,6 +103,7 @@ def build_model_for_eval(
     shard_unsharded_model: bool = False,  # If the model is not sharded, shard it. No effect if already sharded on disk
 ):
     model, _ = build_model_from_cfg(config, only_teacher=True)
+    runtime_device = get_device()
     if pretrained_weights is None or pretrained_weights == "":
         logger.info("No pretrained weights")
         model.init_weights()
@@ -113,8 +115,8 @@ def build_model_for_eval(
         moduledict = nn.ModuleDict({"backbone": model})
         # Wrap with FSDP
         ac_compile_parallelize(moduledict, inference_only_models=[], cfg=config)
-        # Move to CUDA
-        model.to_empty(device="cuda")
+        # Move to runtime device
+        model.to_empty(device=runtime_device)
         # Load checkpoint
         load_checkpoint(pretrained_weights, model=moduledict, strict_loading=True)
         shard_unsharded_model = False
@@ -123,7 +125,7 @@ def build_model_for_eval(
         from dinov3.checkpointer import init_model_from_checkpoint_for_evals
 
         # consolidated checkpoint codepath
-        model.to_empty(device="cuda")
+        model.to_empty(device=runtime_device)
         init_model_from_checkpoint_for_evals(model, pretrained_weights, "teacher")
     if shard_unsharded_model:
         logger.info("Sharding model")
