@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from functools import partial
+
+
 class InversePatchEmbeddingMLP(nn.Module):
     """
     Input:  x [B, 196, D]
@@ -22,17 +23,37 @@ class InversePatchEmbeddingMLP(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for module in self.net:
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        conv_layers = [m for m in self.net if isinstance(m, nn.Conv2d)]
+        if not conv_layers:
+            return
+
+        # Conservative init for early layers and zero-init last projection for stability.
+        for module in conv_layers[:-1]:
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        last = conv_layers[-1]
+        nn.init.zeros_(last.weight)
+        if last.bias is not None:
+            nn.init.zeros_(last.bias)
+
         if isinstance(self.norm, nn.LayerNorm):
-            self.norm.reset_parameters()
+            nn.init.ones_(self.norm.weight)
+            nn.init.zeros_(self.norm.bias)
 
     def forward(self, x):
         B, N, D = x.shape
         assert N == 196, "N must be 196 (14x14)"
+
+        out_dtype = x.dtype
+        conv_weight = self.net[0].weight
+        x = torch.nan_to_num(
+            x.to(dtype=conv_weight.dtype, device=conv_weight.device),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
         # [B, 196, D] -> [B, D, 14, 14]
         x = x.view(B, 14, 14, D).permute(0, 3, 1, 2)
@@ -43,6 +64,7 @@ class InversePatchEmbeddingMLP(nn.Module):
 
         # [B, D]
         g = g.squeeze(-1).squeeze(-1)
-        
+
         g_norm = self.norm(g)
-        return g_norm
+        g_norm = torch.nan_to_num(g_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        return g_norm.to(dtype=out_dtype)

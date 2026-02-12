@@ -144,6 +144,7 @@ class DTCH_BALANCE(nn.Module):
         dt_exp_power: Optional[float] = None,
         balance_beta: float = 1,
         history_update: str = "cache",
+        history_cache_recompute_interval: int = 10000,
     ):
         super().__init__()
         self.K = K
@@ -177,6 +178,11 @@ class DTCH_BALANCE(nn.Module):
             balance_beta = _cfg_select(cfg, "ch_sk.balance_beta", balance_beta)
             history_update = _cfg_select(cfg, "ch_sk.history_update", history_update)
             history_update = _cfg_select(cfg, "ch_sk.history_update_mode", history_update)
+            history_cache_recompute_interval = _cfg_select(
+                cfg,
+                "ch_sk.history_cache_recompute_interval",
+                history_cache_recompute_interval,
+            )
 
         self.boost_alpha = float(boost_alpha)
         self.boost_w_max = float(boost_w_max)
@@ -196,12 +202,16 @@ class DTCH_BALANCE(nn.Module):
                 _log_line(f"Unknown history_update {history_update}, fallback to ema")
             mode = "ema"
         self.history_update = mode
+        self.history_cache_recompute_interval = int(history_cache_recompute_interval)
+        if self.history_cache_recompute_interval < 0:
+            self.history_cache_recompute_interval = 0
 
         self._history_cache = None  # [n_cache, K], LRU ring buffer (rank-local)
         self._history_cache_pos = 0
         self._history_cache_batch = None
         self._history_cache_size_eff = None
         self._history_cache_capacity = 0
+        self._history_cache_update_steps = 0
         self._history_log_init = False
         self.log_enabled = True
         self.log_fn = _log_line
@@ -751,6 +761,7 @@ class DTCH_BALANCE(nn.Module):
         _, b_local = Q_local.shape
         eff_size = self._effective_history_size(b_local)
         if init_mode == "checkpoint":
+            self._history_cache_update_steps = 0
             return
         capacity = max(1, eff_size // b_local)
         device = Q_local.device
@@ -771,6 +782,7 @@ class DTCH_BALANCE(nn.Module):
         self._history_cache_batch = b_local
         self._history_cache_size_eff = eff_size
         self._history_cache_capacity = capacity
+        self._history_cache_update_steps = 0
 
     def _ensure_history_Q(self, Q_local):
         _, b_local = Q_local.shape
@@ -841,6 +853,17 @@ class DTCH_BALANCE(nn.Module):
         self.history_Q = self.history_Q - old + sum_Q_local_f64
         self._history_cache[pos] = sum_Q_local
         self._history_cache_pos = (pos + 1) % self._history_cache_capacity
+        self._history_cache_update_steps += 1
+
+        # Periodically rebuild the history sum from full cache to avoid drift
+        # from long-running incremental add/sub updates.
+        interval = int(self.history_cache_recompute_interval)
+        if interval > 0 and (self._history_cache_update_steps % interval == 0):
+            self.history_Q = torch.sum(
+                self._history_cache,
+                dim=0,
+                dtype=self.history_Q.dtype,
+            )
 
     @torch.no_grad()
     def forward(

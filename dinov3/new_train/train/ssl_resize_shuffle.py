@@ -127,6 +127,8 @@ class SSLResizeShuffle(SSLMetaArch):
             0.0,
         )
         self.patch_size = int(_sel("resize_shuffle_augmentor.patch_size", cfg.student.patch_size))
+        self.bridge_pre_head_clip = float(_sel("resize_shuffle_augmentor.bridge_pre_head_clip", 10.0))
+        self.bridge_logits_clip = float(_sel("resize_shuffle_augmentor.bridge_logits_clip", 30.0))
 
         cls_hist_cache = getattr(cfg.dtch, "cls_hist_cache", None)
         patch_hist_cache = getattr(cfg.dtch, "patch_hist_cache", None)
@@ -142,10 +144,20 @@ class SSLResizeShuffle(SSLMetaArch):
         self.patchshuffle_patch_loss = iBOTPatchLoss(self.patchshuffle_out_dim, hist_cache=patch_hist_cache)
         self.patchshuffle_patch_loss_resized = iBOTPatchLoss(self.patchshuffle_out_dim, hist_cache=patch_hist_cache)
 
-        if (self.bridge_patchshuffle_weight > 0.0 or self.bridge_global_weight > 0.0) and "bridge_patch_mlp" not in self.student:
+        bridge_patchshuffle_schedule = self._resize_shuffle_weight_schedules.get("bridge_patchshuffle")
+        bridge_global_schedule = self._resize_shuffle_weight_schedules.get("bridge_global")
+        bridge_schedule_active = (
+            (bridge_patchshuffle_schedule is not None and float(np.max(bridge_patchshuffle_schedule)) > 0.0)
+            or (bridge_global_schedule is not None and float(np.max(bridge_global_schedule)) > 0.0)
+        )
+        bridge_active = (
+            self.bridge_patchshuffle_weight > 0.0 or self.bridge_global_weight > 0.0 or bridge_schedule_active
+        )
+        if bridge_active and "bridge_patch_mlp" not in self.student:
             bridge_hidden_dim = OmegaConf.select(cfg, "bridge.hidden_dim", default=None)
             self.student["bridge_patch_mlp"] = InversePatchEmbeddingMLP(self.embed_dim, hidden_dim=bridge_hidden_dim)
             self.teacher["bridge_patch_mlp"] = InversePatchEmbeddingMLP(self.embed_dim, hidden_dim=bridge_hidden_dim)
+            self.teacher["bridge_patch_mlp"].load_state_dict(self.student["bridge_patch_mlp"].state_dict())
 
         self._batch_meta: Dict[str, Any] = {}
         self._resize_shuffle_outputs: Optional[dict] = None
@@ -285,6 +297,29 @@ class SSLResizeShuffle(SSLMetaArch):
             return None
         return self.student["bridge_patch_mlp"]
 
+    def _sanitize_bridge_tensor(self, x: Tensor, clip_value: float) -> Tensor:
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        if clip_value > 0.0:
+            x = x.clamp(min=-clip_value, max=clip_value)
+        return x
+
+    @torch.no_grad()
+    def _recover_bridge_mlp_if_non_finite(self) -> None:
+        bridge_mlp = self._get_bridge_patch_mlp()
+        if bridge_mlp is None:
+            return
+        has_non_finite = False
+        for param in bridge_mlp.parameters():
+            if not torch.isfinite(param).all():
+                has_non_finite = True
+                break
+        if not has_non_finite:
+            return
+        logger.warning("Detected non-finite bridge_patch_mlp parameters; resetting bridge MLP.")
+        bridge_mlp.reset_parameters()
+        if "bridge_patch_mlp" in self.teacher:
+            self.teacher["bridge_patch_mlp"].load_state_dict(bridge_mlp.state_dict())
+
     def _add_bridge_logits(
         self,
         outputs: ResizeShuffleStudentOutputs,
@@ -310,14 +345,20 @@ class SSLResizeShuffle(SSLMetaArch):
         except Exception as exc:
             logger.warning("%s bridge input skipped: %s", prefix, exc)
             return
+        bridge_resized_pre = self._sanitize_bridge_tensor(bridge_resized_pre, self.bridge_pre_head_clip)
+        bridge_original_pre = self._sanitize_bridge_tensor(bridge_original_pre, self.bridge_pre_head_clip)
 
         resized_attr = f"{prefix}_logits_resized"
         original_attr = f"{prefix}_logits_original"
         if not hasattr(outputs, resized_attr) or not hasattr(outputs, original_attr):
             logger.warning("unknown bridge output prefix: %s", prefix)
             return
-        setattr(outputs, resized_attr, frozen_dino_head_forward(self.student.dino_head, bridge_resized_pre))
-        setattr(outputs, original_attr, frozen_dino_head_forward(self.student.dino_head, bridge_original_pre))
+        bridge_resized_logits = frozen_dino_head_forward(self.student.dino_head, bridge_resized_pre)
+        bridge_original_logits = frozen_dino_head_forward(self.student.dino_head, bridge_original_pre)
+        bridge_resized_logits = self._sanitize_bridge_tensor(bridge_resized_logits, self.bridge_logits_clip)
+        bridge_original_logits = self._sanitize_bridge_tensor(bridge_original_logits, self.bridge_logits_clip)
+        setattr(outputs, resized_attr, bridge_resized_logits)
+        setattr(outputs, original_attr, bridge_original_logits)
 
     def _build_teacher_cls_targets_for_resize_shuffle(
         self,
@@ -388,6 +429,41 @@ class SSLResizeShuffle(SSLMetaArch):
             return None
 
         teacher_r_cls_targets, teacher_o_cls_targets = teacher_cls_targets
+
+        # For global-bridge, treat the two global views as one merged branch.
+        # This avoids enforcing an artificial resized/original split on global student outputs.
+        if branch_prefix == "bridge_global":
+            student_chunks = []
+            teacher_chunks = []
+            if torch.is_tensor(bridge_logits_resized):
+                student_chunks.append(bridge_logits_resized)
+                teacher_chunks.append(teacher_r_cls_targets)
+            if torch.is_tensor(bridge_logits_original):
+                student_chunks.append(bridge_logits_original)
+                teacher_chunks.append(teacher_o_cls_targets)
+            if not student_chunks:
+                return None
+            merged_student_logits = (
+                torch.cat(student_chunks, dim=0) if len(student_chunks) > 1 else student_chunks[0]
+            )
+            merged_teacher_targets = (
+                torch.cat(teacher_chunks, dim=0) if len(teacher_chunks) > 1 else teacher_chunks[0]
+            )
+            merged_teacher_targets = self._align_teacher_targets_for_bridge(
+                student_logits=merged_student_logits,
+                teacher_targets=merged_teacher_targets,
+                side="merged",
+                branch=branch_prefix,
+            )
+            if merged_teacher_targets is None:
+                return None
+            merged_loss = self.patchshuffle_cls_loss(
+                merged_student_logits.unsqueeze(0), merged_teacher_targets.unsqueeze(0)
+            )
+            if not torch.isfinite(merged_loss):
+                return None
+            return merged_loss, None, None
+
         loss_resized = None
         loss_original = None
         if torch.is_tensor(bridge_logits_resized):
@@ -401,6 +477,8 @@ class SSLResizeShuffle(SSLMetaArch):
                 loss_resized = self.patchshuffle_cls_loss_resized(
                     bridge_logits_resized.unsqueeze(0), teacher_r_cls_targets_aligned.unsqueeze(0)
                 )
+                if not torch.isfinite(loss_resized):
+                    loss_resized = None
         if torch.is_tensor(bridge_logits_original):
             teacher_o_cls_targets_aligned = self._align_teacher_targets_for_bridge(
                 student_logits=bridge_logits_original,
@@ -412,6 +490,8 @@ class SSLResizeShuffle(SSLMetaArch):
                 loss_original = self.patchshuffle_cls_loss(
                     bridge_logits_original.unsqueeze(0), teacher_o_cls_targets_aligned.unsqueeze(0)
                 )
+                if not torch.isfinite(loss_original):
+                    loss_original = None
 
         if loss_resized is None and loss_original is None:
             return None
@@ -430,6 +510,7 @@ class SSLResizeShuffle(SSLMetaArch):
         self._cached_data = data
         self._resize_shuffle_outputs = {}
         self._update_resize_shuffle_weights(iteration)
+        self._recover_bridge_mlp_if_non_finite()
 
         device = get_device()
         if "resize_shuffle_aug_resized" in data and isinstance(data["resize_shuffle_aug_resized"], dict):
@@ -1109,13 +1190,16 @@ class SSLResizeShuffle(SSLMetaArch):
             )
             if bridge_global_loss is not None:
                 bridge_global_total, bridge_global_resized, bridge_global_original = bridge_global_loss
-                loss_dict["aug/bridge_global_loss"] = bridge_global_total
-                if bridge_global_resized is not None:
-                    loss_dict["aug/bridge_global_resized_loss"] = bridge_global_resized
-                if bridge_global_original is not None:
-                    loss_dict["aug/bridge_global_original_loss"] = bridge_global_original
-                loss_dict["aug/bridge_global_weight"] = float(bridge_global_weight)
-                loss_acc = loss_acc + (bridge_global_weight * bridge_global_total)
+                if not torch.isfinite(bridge_global_total):
+                    logger.warning("bridge_global_loss is non-finite; skipping this branch for current iteration.")
+                else:
+                    loss_dict["aug/bridge_global_loss"] = bridge_global_total
+                    if bridge_global_resized is not None and torch.isfinite(bridge_global_resized):
+                        loss_dict["aug/bridge_global_resized_loss"] = bridge_global_resized
+                    if bridge_global_original is not None and torch.isfinite(bridge_global_original):
+                        loss_dict["aug/bridge_global_original_loss"] = bridge_global_original
+                    loss_dict["aug/bridge_global_weight"] = float(bridge_global_weight)
+                    loss_acc = loss_acc + (bridge_global_weight * bridge_global_total)
 
         if bridge_patchshuffle_weight > 0.0:
             bridge_patchshuffle_loss = self._loss_bridge_branch_from_resize_shuffle(
@@ -1129,13 +1213,16 @@ class SSLResizeShuffle(SSLMetaArch):
                     bridge_patchshuffle_resized,
                     bridge_patchshuffle_original,
                 ) = bridge_patchshuffle_loss
-                loss_dict["aug/bridge_patchshuffle_loss"] = bridge_patchshuffle_total
-                if bridge_patchshuffle_resized is not None:
-                    loss_dict["aug/bridge_patchshuffle_resized_loss"] = bridge_patchshuffle_resized
-                if bridge_patchshuffle_original is not None:
-                    loss_dict["aug/bridge_patchshuffle_original_loss"] = bridge_patchshuffle_original
-                loss_dict["aug/bridge_patchshuffle_weight"] = float(bridge_patchshuffle_weight)
-                loss_acc = loss_acc + (bridge_patchshuffle_weight * bridge_patchshuffle_total)
+                if not torch.isfinite(bridge_patchshuffle_total):
+                    logger.warning("bridge_patchshuffle_loss is non-finite; skipping this branch for current iteration.")
+                else:
+                    loss_dict["aug/bridge_patchshuffle_loss"] = bridge_patchshuffle_total * 0.5
+                    if bridge_patchshuffle_resized is not None and torch.isfinite(bridge_patchshuffle_resized):
+                        loss_dict["aug/bridge_patchshuffle_resized_loss"] = bridge_patchshuffle_resized
+                    if bridge_patchshuffle_original is not None and torch.isfinite(bridge_patchshuffle_original):
+                        loss_dict["aug/bridge_patchshuffle_original_loss"] = bridge_patchshuffle_original
+                    loss_dict["aug/bridge_patchshuffle_weight"] = float(bridge_patchshuffle_weight)
+                    loss_acc = loss_acc + (bridge_patchshuffle_weight * bridge_patchshuffle_total * 0.5)
 
         return loss_acc
 
@@ -1168,7 +1255,7 @@ class SSLResizeShuffle(SSLMetaArch):
             return loss_acc, loss_dict
 
         ibot_loss = loss_dict.get("ibot_loss")
-        ibot_loss_ok = ibot_loss is not None and float(ibot_loss.detach().item()) < 3.0
+        ibot_loss_ok = ibot_loss is not None and float(ibot_loss.detach().item()) < 4.0
 
         weights = self._get_resize_shuffle_weights()
         student_aux_outputs, teacher_aux_outputs = self._resolve_resize_shuffle_aux_outputs(
