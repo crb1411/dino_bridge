@@ -1,811 +1,293 @@
-🆕 [2025-09-17] :fire: DINOv3 backbones are now supported by the [PyTorch Image Models / timm](https://github.com/huggingface/pytorch-image-models/) library starting with version [1.0.20](https://github.com/huggingface/pytorch-image-models/releases/tag/v1.0.20)
+# dino_bridge
 
-[2025-08-29] DINOv3 backbones are [supported](https://huggingface.co/docs/transformers/model_doc/dinov3) by released versions of the Hugging Face [Transformers](https://huggingface.co/docs/transformers/index) library starting with version [4.56.0](https://github.com/huggingface/transformers/releases/tag/v4.56.0)
+`dino_bridge` 是基于 DINOv3 的 CRB 分支，目标是在受限算力下稳定训练高质量视觉压缩表征（`D=1024`），并增强对细粒度结构的可迁移能力。
 
-[2025-08-14] DINOv3 backbones are now available in [Hugging Face Hub](https://huggingface.co/collections/facebook/dinov3-68924841bd6b561778e31009) and [supported](https://huggingface.co/docs/transformers/model_doc/dinov3) by the [development](https://github.com/huggingface/transformers/) version of the Hugging Face [Transformers](https://huggingface.co/docs/transformers/index) library
+原始官方文档已完整保留为：`README_dinov3.md`。
 
-# DINOv3 🦖🦖🦖
+## 1. 方法摘要（基于论文内容）
 
-**[Meta AI Research, FAIR](https://ai.meta.com/research/)**
+本分支把 SSL 视为“视觉压缩器”训练问题：把高维图像压缩到紧凑向量，同时保持下游任务可用信息。
 
-Oriane Siméoni, Huy V. Vo, Maximilian Seitzer, Federico Baldassarre, Maxime Oquab, <br/>
-Cijo Jose, Vasil Khalidov, Marc Szafraniec, Seungeun Yi, Michaël Ramamonjisoa, <br/>
-Francisco Massa, Daniel Haziza, Luca Wehrstedt, Jianyuan Wang, <br/>
-Timothée Darcet, Théo Moutakanni, Leonel Sentana, Claire Roberts, <br/>
-Andrea Vedaldi, Jamie Tolan, John Brandt, Camille Couprie, <br/>
-Julien Mairal, Hervé Jégou, Patrick Labatut, Piotr Bojanowski
+核心设计可以概括为 3+1：
 
-[ :scroll: [`Paper`](https://arxiv.org/abs/2508.10104)] [ :newspaper: [`Blog`](https://ai.meta.com/blog/dinov3-self-supervised-vision-model/)] [ :globe_with_meridians: [`Website`](https://ai.meta.com/dinov3/)] [ :book: [`BibTeX`](#citing-dinov3)]
+- `DTCH-SK`（Dual-Temperature Cumulative History Sinkhorn）
+  - 在更平滑的 soft 空间做历史均衡（balanced）。
+  - 在后处理用幂次恢复单样本尖锐性（crisp）。
+  - 解决大原型字典（如 `K=65536`）+ 小 batch 下“均衡与尖锐冲突”的训练动态问题。
+- `Invariant Learning`（正交不变性）
+  - `Crop-Resize`: 强化尺度变化下的全局语义一致性（主对齐 CLS）。
+  - `PatchRoll`: 强化温和重排下的全局 + 局部鲁棒性（CLS + 稀疏 patch 对齐）。
+- `Patch-to-CLS Bridging`
+  - 用 Inverse Patch Embedding 聚合 patch token，构造 patch-global 表征。
+  - 在原型空间对齐 teacher CLS，把 patch 细节显式蒸馏进最终 CLS 压缩向量。
+- `DINO/iBOT` 原有结构保留并协同
+  - DINO local/global + iBOT patch + KoLeo 与上述模块可组合训练。
 
-Reference PyTorch implementation and models for DINOv3. For details, see the **[DINOv3](https://arxiv.org/abs/2508.10104)** paper.
+## 2. 当前分支关键工程点
 
-## Overview
+- 训练入口：`dinov3/new_train/train/train_img.py`
+- 自动设备选择：`dinov3/new_train/utils/auto_device.py`
+  - 统一支持 `cuda / npu / mps / xpu / cpu`。
+- FSDP+Compile：`dinov3/fsdp/ac_compile_parallelize.py`
+  - 当配置 `train.compile=true` 且设备不是 CUDA（如 NPU）时，会自动跳过 `torch.compile`，不阻塞训练。
+- DTCH 实现：`dinov3/new_train/dtch/dtch_blance.py`
+- Bridge 聚合器：`dinov3/new_train/models/inverse_patch.py`
+- Resize/Shuffle 元架构：`dinov3/new_train/train/ssl_resize_shuffle.py`
 
-<div align="center">
-  <img width="1364" height="1024" alt="market" src="https://github.com/user-attachments/assets/1411f491-988e-49cb-95ae-d03fe6e3c268" />
+## 3. 训练启动（示例）
 
-  <i></em><b>High-resolution dense features.</b><br/>We visualize the cosine similarity maps obtained with DINOv3 output features<br/> between the patches marked with a red cross and all other patches.</i>
-</div>
+当前使用脚本为 `run/run_ssl_debug.sh`，核心命令等价于：
 
-<br/>
-
-An extended family of versatile vision foundation models producing high-quality dense features and achieving outstanding performance on various vision tasks including outperforming the specialized state of the art across a broad range of settings, without fine-tuning
-
-## Pretrained models
-
-:information_source: Please follow the link provided below to get access to all the model weights: once accepted, an e-mail will be sent with the complete list of URLs pointing to all the available model weights (both backbones and adapters). These URLs can then be used to either:
-- download the model or adapter weights to a local filesystem and point `torch.hub.load()` to these local weights via the `weights` or `backbone_weights` parameters, or
-- directly invoke `torch.hub.load()` to download and load a backbone or an adapter from its URL via also the `weights` or `backbone_weights` parameters.
-
-See the example code snippets below.
-
-:warning: Please use `wget` instead of a web browser to download the weights.
-
-ViT models pretrained on web dataset (LVD-1689M):
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th>Model</th>
-      <th>Parameters</th>
-      <th>Pretraining<br/>Dataset</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ViT-S/16 distilled </td>
-      <td align="right">21M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ViT-S+/16 distilled</td>
-      <td align="right">29M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ViT-B/16 distilled</td>
-      <td align="right">86M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ViT-L/16 distilled</td>
-      <td align="right">300M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ViT-H+/16 distilled</td>
-      <td align="right">840M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ViT-7B/16</td>
-      <td align="right">6,716M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-  </tbody>
-</table>
-
-ConvNeXt models pretrained on web dataset (LVD-1689M):
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th>Model</th>
-      <th>Parameters</th>
-      <th>Pretraining<br/>Dataset</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ConvNeXt Tiny</td>
-      <td align="right">29M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ConvNeXt Small</td>
-      <td align="right">50M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ConvNeXt Base</td>
-      <td align="right">89M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ConvNeXt Large</td>
-      <td align="right">198M</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-  </tbody>
-</table>
-
-ViT models pretrained on satellite dataset (SAT-493M):
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th>Model</th>
-      <th>Parameters</th>
-      <th>Pretraining<br/>Dataset</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ViT-L/16 distilled</td>
-      <td align="right">300M</td>
-      <td align="center">SAT-493M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-    <tr>
-      <td>ViT-7B/16</td>
-      <td align="right">6,716M</td>
-      <td align="center">SAT-493M</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-  </tbody>
-</table>
-
-
-### Pretrained backbones (via PyTorch [Hub](https://docs.pytorch.org/docs/stable/hub.html))
-
-Please follow the instructions [here](https://pytorch.org/get-started/locally/) to install PyTorch (the only required dependency for loading the model). Installing PyTorch with CUDA support is strongly recommended.
-
-```python
-import torch
-
-REPO_DIR = <PATH/TO/A/LOCAL/DIRECTORY/WHERE/THE/DINOV3/REPO/WAS/CLONED>
-
-# DINOv3 ViT models pretrained on web images
-dinov3_vits16 = torch.hub.load(REPO_DIR, 'dinov3_vits16', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_vits16plus = torch.hub.load(REPO_DIR, 'dinov3_vits16plus', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_vitb16 = torch.hub.load(REPO_DIR, 'dinov3_vitb16', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_vitl16 = torch.hub.load(REPO_DIR, 'dinov3_vitl16', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_vith16plus = torch.hub.load(REPO_DIR, 'dinov3_vith16plus', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_vit7b16 = torch.hub.load(REPO_DIR, 'dinov3_vit7b16', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-
-# DINOv3 ConvNeXt models pretrained on web images
-dinov3_convnext_tiny = torch.hub.load(REPO_DIR, 'dinov3_convnext_tiny', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_convnext_small = torch.hub.load(REPO_DIR, 'dinov3_convnext_small', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_convnext_base = torch.hub.load(REPO_DIR, 'dinov3_convnext_base', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_convnext_large = torch.hub.load(REPO_DIR, 'dinov3_convnext_large', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-
-# DINOv3 ViT models pretrained on satellite imagery
-dinov3_vitl16 = torch.hub.load(REPO_DIR, 'dinov3_vitl16', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
-dinov3_vit7b16 = torch.hub.load(REPO_DIR, 'dinov3_vit7b16', source='local', weights=<CHECKPOINT/URL/OR/PATH>)
+```bash
+torchrun \
+  --nnodes=1 \
+  --nproc_per_node=1 \
+  --node_rank=0 \
+  --master_addr=127.0.0.1 \
+  --master_port=40028 \
+  -m dinov3.new_train.train.train_img \
+  --config-file /mnt/seek/ssl/dinov3/run/dinov3_vitlarge_pretrain.yaml \
+  --checkpoint_dir <ckpt_path> \
+  --output-dir <output_dir>
 ```
 
-### Pretrained backbones (via Hugging Face [Transformers](https://huggingface.co/docs/transformers/))
+NPU 场景建议保留：
 
-All the backbones are available in the [DINOv3](https://huggingface.co/collections/facebook/dinov3-68924841bd6b561778e31009) collection on Hugging Face Hub and supported via the Hugging Face [Transformers](https://huggingface.co/docs/transformers/index) library (with released packages from version 4.56.0). Please refer to the corresponding documentation for usage, but below is a short example that demonstrates how to obtain an image embedding with either [Pipeline] or the [AutoModel] class.
-
-```python
-from transformers import pipeline
-from transformers.image_utils import load_image
-
-url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg"
-image = load_image(url)
-
-feature_extractor = pipeline(
-    model="facebook/dinov3-convnext-tiny-pretrain-lvd1689m",
-    task="image-feature-extraction", 
-)
-features = feature_extractor(image)
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=40028
 ```
 
-```python
-import torch
-from transformers import AutoImageProcessor, AutoModel
-from transformers.image_utils import load_image
-
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-image = load_image(url)
-
-pretrained_model_name = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m"
-processor = AutoImageProcessor.from_pretrained(pretrained_model_name)
-model = AutoModel.from_pretrained(
-    pretrained_model_name, 
-    device_map="auto", 
-)
-
-inputs = processor(images=image, return_tensors="pt").to(model.device)
-with torch.inference_mode():
-    outputs = model(**inputs)
-
-pooled_output = outputs.pooler_output
-print("Pooled output shape:", pooled_output.shape)
-```
-
-where `model` and `pretrained_model_name` above can be one of:
-- `facebook/dinov3-vits16-pretrain-lvd1689m`
-- `facebook/dinov3-vits16plus-pretrain-lvd1689m`
-- `facebook/dinov3-vitb16-pretrain-lvd1689m`
-- `facebook/dinov3-vitl16-pretrain-lvd1689m`
-- `facebook/dinov3-vith16plus-pretrain-lvd1689m`
-- `facebook/dinov3-vit7b16-pretrain-lvd1689m`
-- `facebook/dinov3-convnext-base-pretrain-lvd1689m`
-- `facebook/dinov3-convnext-large-pretrain-lvd1689m`
-- `facebook/dinov3-convnext-small-pretrain-lvd1689m`
-- `facebook/dinov3-convnext-tiny-pretrain-lvd1689m`
-- `facebook/dinov3-vitl16-pretrain-sat493m`
-- `facebook/dinov3-vit7b16-pretrain-sat493m`
-
-### Image transforms
-
-For models using the LVD-1689M weights (pretrained on web images), please use the following transform (standard ImageNet evaluation transform):
-
-```python
-import torchvision
-from torchvision.transforms import v2
-
-def make_transform(resize_size: int = 256):
-    to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
-    to_float = v2.ToDtype(torch.float32, scale=True)
-    normalize = v2.Normalize(
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-    )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
-```
-
-
-For models using the SAT-493M weights (pretrained on satellite imagery), please use the following transform:
-
-
-```python
-import torchvision
-from torchvision.transforms import v2
-
-def make_transform(resize_size: int = 256):
-    to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
-    to_float = v2.ToDtype(torch.float32, scale=True)
-    normalize = v2.Normalize(
-        mean=(0.430, 0.411, 0.296),
-        std=(0.213, 0.156, 0.143),
-    )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
-```
-
-### Pretrained heads - Image classification
-
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th>Backbone</th>
-      <th>Pretraining<br/>Dataset</th>
-      <th>Head<br/>Dataset</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ViT-7B/16</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center">ImageNet</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-  </tbody>
-</table>
-
-
-The (full) classifier models can be loaded via PyTorch Hub:
-
-```python
-import torch
-
-# DINOv3
-dinov3_vit7b16_lc = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_lc', source="local", weights=<DEPTHER/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
-
-```
-
-### Pretrained heads - Depther trained on SYNTHMIX dataset
-
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th>Backbone</th>
-      <th>Pretraining<br/>Dataset</th>
-      <th>Head<br/>Dataset</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ViT-7B/16</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center">SYNTHMIX</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-  </tbody>
-</table>
-
-
-```python
-depther = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_dd', source="local", weights=<DEPTHER/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
-```
-
-Full example code of depther on an image
-
-```python
-from PIL import Image
-import torch
-from torchvision.transforms import v2
-import matplotlib.pyplot as plt
-from matplotlib import colormaps
-
-def get_img():
-    import requests
-    url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-    image = Image.open(requests.get(url, stream=True).raw).convert("RGB")
-    return image
-
-def make_transform(resize_size: int | list[int] = 768):
-    to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
-    to_float = v2.ToDtype(torch.float32, scale=True)
-    normalize = v2.Normalize(
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-    )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
-
-depther = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_dd', source="local", weights=<DEPTHER/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
-
-img_size = 1024
-img = get_img()
-transform = make_transform(img_size)
-with torch.inference_mode():
-    with torch.autocast('cuda', dtype=torch.bfloat16):
-        batch_img = transform(img)[None]
-        batch_img = batch_img
-        depths = depther(batch_img)
-
-plt.figure(figsize=(12, 6))
-plt.subplot(121)
-plt.imshow(img)
-plt.axis("off")
-plt.subplot(122)
-plt.imshow(depths[0,0].cpu(), cmap=colormaps["Spectral"])
-plt.axis("off")
-
-```
-
-#### Reproduce paper results
-
-Make sure the NYU dataset is setup following [this](DATASETS.md#depth-estimation-on-nyu).
-
-Launch the following to reproduce our paper's depth estimation results on NYUv2 with the pretrained Depther trained on SYNTHMIX:
-
-```shell
-PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/depth/run.py \
-config=dinov3/eval/depth/configs/config-nyu-synthmix-dpt-inference.yaml \
-datasets.root=<PATH/TO/DATASET> \
-load_from=dinov3_vit7b16_dd \
---output-dir <PATH/TO/OUTPUT/DIR>
-```
-
-Notes:
-- if you want to launch the code without dinov3.run.submit, you can do so using python directly or torchrun:
-
-```shell
-PYTHONPATH=. python dinov3/eval/depth/run.py \
-config=dinov3/eval/depth/configs/config-nyu-synthmix-dpt-inference.yaml \
-datasets.root=<PATH/TO/DATASET> \
-load_from=dinov3_vit7b16_dd \
-output_dir=<PATH/TO/OUTPUT/DIR>
-```
-
-- One can also save prediction results using `result_config.save_results=true`.
-
-
-#### Linear depth estimation on NYUv2 Depth
-```shell
-PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/depth/run.py \
-    model.dino_hub=dinov3_vit7b16 \
-    config=dinov3/eval/depth/configs/config-nyu.yaml \
-    datasets.root=<PATH/TO/DATASET> \
-    --output-dir <PATH/TO/OUTPUT/DIR>
-```
-
-After the job completes, you will find in the output path directory you specified
-- `depth_config.yaml` that contains the config you trained the model with;
-- `model_final.pth`, the final linear head checkpoint at the end of training; and
-- `results-depth.csv` with the final metrics.
-
-### Pretrained heads - Detector trained on COCO2017 dataset
-
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th>Backbone</th>
-      <th>Pretraining<br/>Dataset</th>
-      <th>Head<br/>Dataset</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ViT-7B/16</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center">COCO2017</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-  </tbody>
-</table>
-
-
-```python
-detector = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_de', source="local", weights=<DETECTOR/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
-```
-
-### Pretrained heads - Segmentor trained on ADE20K dataset
-
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th>Backbone</th>
-      <th>Pretraining<br/>Dataset</th>
-      <th>Head<br/>Dataset</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ViT-7B/16</td>
-      <td align="center">LVD-1689M</td>
-      <td align="center">ADE20K</td>
-      <td align="center"><a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a></td>
-    </tr>
-  </tbody>
-</table>
-
-```python
-segmentor = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_ms', source="local", weights=<SEGMENTOR/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
-```
-
-Example command to run a full inference on ADE20K with the provided segmentor (ViT-7B + M2F):
-
-```shell
-PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/segmentation/run.py \
-config=dinov3/eval/segmentation/configs/config-ade20k-m2f-inference.yaml  \
-datasets.root=<PATH/TO/DATASET> \
-load_from=dinov3_vit7b16_ms \
---output-dir <PATH/TO/OUTPUT/DIR>
-```
-
-Full example code of segmentator on an image
-
-```python
-import sys
-sys.path.append(REPO_DIR)
-
-from PIL import Image
-import torch
-from torchvision import transforms
-import matplotlib.pyplot as plt
-from matplotlib import colormaps
-from functools import partial
-from dinov3.eval.segmentation.inference import make_inference
-
-
-def get_img():
-    import requests
-    url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-    image = Image.open(requests.get(url, stream=True).raw).convert("RGB")
-    return image
-
-def make_transform(resize_size: int | list[int] = 768):
-    to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
-    to_float = v2.ToDtype(torch.float32, scale=True)
-    normalize = v2.Normalize(
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-    )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
-
-segmentor = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_ms', source="local", weights=<SEGMENTOR/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
-
-img_size = 896
-img  = get_img()
-transform = make_transform(img_size)
-with torch.inference_mode():
-    with torch.autocast('cuda', dtype=torch.bfloat16):
-        batch_img = transform(img)[None]
-        pred_vit7b = segmentor(batch_img)  # raw predictions  
-        # actual segmentation map
-        segmentation_map_vit7b = make_inference(
-            batch_img,
-            segmentor,
-            inference_mode="slide",
-            decoder_head_type="m2f",
-            rescale_to=(img.size[-1], img.size[-2]),
-            n_output_channels=150,
-            crop_size=(img_size, img_size),
-            stride=(img_size, img_size),
-            output_activation=partial(torch.nn.functional.softmax, dim=1),
-        ).argmax(dim=1, keepdim=True)
-plt.figure(figsize=(12, 6))
-plt.subplot(121)
-plt.imshow(img)
-plt.axis("off")
-plt.subplot(122)
-plt.imshow(segmentation_map_vit7b[0,0].cpu(), cmap=colormaps["Spectral"])
-plt.axis("off")
-```
-
-
-
-
-### Pretrained heads - Zero-shot tasks with `dino.txt`
-
-<table style="margin: auto">
-  <thead>
-    <tr>
-      <th rowspan="2">Backbone</th>
-      <th>Download</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>ViT-L/16 distilled</td>
-      <td align="center">
-        <a href="https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/">[link]</a>,
-        <a href="https://dl.fbaipublicfiles.com/dinov3/thirdparty/bpe_simple_vocab_16e6.txt.gz">vocabulary</a>,
-        <a href="https://dl.fbaipublicfiles.com/dinov2/thirdparty/LICENSE">vocabulary license</a>
-      </td>
-    </tr>
-  </tbody>
-</table>
-
-The (full) dino.txt model can be loaded via PyTorch Hub:
-
-```python
-import torch
-# DINOv3
-dinov3_vitl16_dinotxt_tet1280d20h24l, tokenizer = torch.hub.load(REPO_DIR, 'dinov3_vitl16_dinotxt_tet1280d20h24l', weights=<SEGMENTOR/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
-```
-
-
-## Installation
-
-The training and evaluation code requires PyTorch version >= 2.7.1 as well as a few other 3rd party packages. Note that the code has only been tested with the specified versions and also expects a Linux environment. To setup all the required dependencies for training and evaluation, please follow the instructions below:
-
-*[micromamba](https://mamba.readthedocs.io/en/latest/user_guide/micromamba.html)* **(Recommended)** - Clone the repository and then create and activate a `dinov3` conda environment using the provided environment definition:
-
-```shell
-micromamba env create -f conda.yaml
-micromamba activate dinov3
-```
-
-## Getting started
-
-Several notebooks are provided to get started applying DINOv3:
-- [PCA of patch features](notebooks/pca.ipynb): display the PCA of DINOv3 patch features on a foreground object (rainbow visualizations from the paper) [[Run in Google Colab]](https://colab.research.google.com/github/facebookresearch/dinov3/blob/main/notebooks/pca.ipynb)
-- [Foreground segmentation](notebooks/foreground_segmentation.ipynb): train a linear foreground segmentation model based on DINOv3 features [[Run in Google Colab]](https://colab.research.google.com/github/facebookresearch/dinov3/blob/main/notebooks/foreground_segmentation.ipynb)
-- [Dense and sparse matching](notebooks/dense_sparse_matching.ipynb): match patches from objects on two different images based on DINOv3 features [[Run in Google Colab]](https://colab.research.google.com/github/facebookresearch/dinov3/blob/main/notebooks/dense_sparse_matching.ipynb)
-- [Segmentation tracking](notebooks/segmentation_tracking.ipynb): video segmentation tracking using a non-parametric method based on DINOv3 features [[Run in Google Colab]](https://colab.research.google.com/github/facebookresearch/dinov3/blob/main/notebooks/segmentation_tracking.ipynb)
-- [Zero-shot segmentation with DINOv3-based dino.txt](notebooks/dinotxt_segmentation_inference.ipynb): compute the open-vocabulary segmentation results with dino.txt strategy.
-
-## Data preparation
-
-### ImageNet-1k
-
-The root directory of the dataset should hold the following contents:
-
-- `<ROOT>/test/ILSVRC2012_test_00000001.JPEG`
-- `<ROOT>/test/[..]`
-- `<ROOT>/test/ILSVRC2012_test_00100000.JPEG`
-- `<ROOT>/train/n01440764/n01440764_10026.JPEG`
-- `<ROOT>/train/[...]`
-- `<ROOT>/train/n15075141/n15075141_9993.JPEG`
-- `<ROOT>/val/n01440764/ILSVRC2012_val_00000293.JPEG`
-- `<ROOT>/val/[...]`
-- `<ROOT>/val/n15075141/ILSVRC2012_val_00049174.JPEG`
-- `<ROOT>/labels.txt`
-
-The provided dataset implementation expects a few additional metadata files to be present under the extra directory:
-
-- `<EXTRA>/class-ids-TRAIN.npy`
-- `<EXTRA>/class-ids-VAL.npy`
-- `<EXTRA>/class-names-TRAIN.npy`
-- `<EXTRA>/class-names-VAL.npy`
-- `<EXTRA>/entries-TEST.npy`
-- `<EXTRA>/entries-TRAIN.npy`
-- `<EXTRA>/entries-VAL.npy`
-
-These metadata files can be generated (once) with the following lines of Python code:
-
-```python
-from dinov3.data.datasets import ImageNet
-
-for split in ImageNet.Split:
-    dataset = ImageNet(split=split, root="<ROOT>", extra="<EXTRA>")
-    dataset.dump_extra()
-```
-
-Note that the root and extra directories do not have to be distinct directories.
-
-### ImageNet-22k
-
-Please adapt the [dataset class](dinov3/data/datasets/image_net_22k.py) to match your local setup.
-
-<br />
-
-:warning: To execute the commands provided in the next sections for training and evaluation, the `dinov3` package should be included in the Python module search path, i.e. simply prefix the command to run with `PYTHONPATH=.`.
-
-## Training
-
-### Fast setup: training DINOv3 ViT-L/16 on ImageNet-1k
-
-Run DINOv3 pre-training on 4 H100-80GB nodes (32 GPUs) in a SLURM cluster environment with submitit:
-
-```shell
- PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py \
-  --nodes 4 \
-  --config-file dinov3/configs/train/vitl_im1k_lin834.yaml \
-  --output-dir <PATH/TO/OUTPUT/DIR> \
-  train.dataset_path=ImageNet22k:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
-```
-Training time is approximately 14 hours and the resulting checkpoint should reach 82.0% on k-NN eval and 83.5% on linear eval.
-
-The training code saves the weights of the teacher in the eval folder every 12500 iterations for evaluation.
-
-### Exact DINOv3 setup: training DINOv3 ViT-7B/16
-
-DINOv3 ViT-7B/16 is trained on a private dataset. The training involves 3 stages:
-- Pretraining
-- Gram anchoring
-- High resolution adaptation
-
-#### Pretraining
-
-Launch DINOV3 ViT-7B/16 pretraining on 32 nodes (256 GPUs) in a SLURM cluster environment with submitit.
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py \
-  --nodes 32 \
-  --config-file dinov3/configs/train/dinov3_vit7b16_pretrain.yaml \
-  --output-dir <PATH/TO/OUTPUT/DIR> \
-  train.dataset_path=<DATASET>:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
-```
-
-#### Gram anchoring
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py \
-  --nodes 32 \
-  --config-file dinov3/configs/train/dinov3_vit7b16_gram_anchor.yaml \
-  --output-dir <PATH/TO/OUTPUT/DIR> \
-  train.dataset_path=<DATASET>:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET> \
-  gram.ckpt=<PATH/TO/GRAM_TEACHER_FROM_PREVIOUS_STEP>   
-```
-
-#### High-resolution adaptation
-
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py \
-  --nodes 32 \
-  --config-file dinov3/configs/train/dinov3_vit7b16_high_res_adapt.yaml \
-  --output-dir <PATH/TO/OUTPUT/DIR> \
-  train.dataset_path=<DATASET>:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET> \
-  gram.ckpt=<PATH/TO/TEACHER_FROM_GRAM> \
-  student.resume_from_teacher_chkpt=<PATH/TO/TEACHER_FROM_GRAM>
-```
-
-## Multi-distillation 
-
-### Test setup:
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py \
-  --nodes 1 \
-  --config-file dinov3/configs/train/multi_distillation_test.yaml \
-  --output-dir <PATH/TO/OUTPUT/DIR> \
-  --multi-distillation \
-  train.dataset_path=<DATASET>:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
-```
-
-## Evaluation
-
-The training code regularly saves the teacher weights. In order to evaluate the model, run the following evaluation on a single node:
-
-
-### Logistic regression classification on ImageNet-1k
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/log_regression.py \
-  model.config_file=<PATH/TO/OUTPUT/DIR>/config.yaml \
-  model.pretrained_weights=<PATH/TO/OUTPUT/DIR>/teacher_checkpoint.pth \
-  output_dir=<PATH/TO/OUTPUT/DIR> \
-  train.dataset=ImageNet:split=TRAIN:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET> \
-  eval.test_dataset=ImageNet:split=VAL:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
-```
-
-### k-NN classification on ImageNet-1k
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/knn.py \
-  model.config_file=<PATH/TO/OUTPUT/DIR>/config.yaml \
-  model.pretrained_weights=<PATH/TO/OUTPUT/DIR>/teacher_checkpoint.pth \
-  output_dir=<PATH/TO/OUTPUT/DIR> \
-  train.dataset=ImageNet:split=TRAIN:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET> \
-  eval.test_dataset=ImageNet:split=VAL:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
-```
-
-### Linear classification with data augmentation on ImageNet-1k
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/linear.py \
-  model.config_file=<PATH/TO/OUTPUT/DIR>/config.yaml \
-  model.pretrained_weights=<PATH/TO/OUTPUT/DIR>/teacher_checkpoint.pth \
-  output_dir=<PATH/TO/OUTPUT/DIR> \
-  train.dataset=ImageNet:split=TRAIN:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET> \
-  train.val_dataset=ImageNet:split=VAL:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
-```
-
-### Linear segmentation with data augmentation on ADE20K
-
-```shell
-PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/segmentation/run.py \
-model.dino_hub=dinov3_vit7b16 \
-config=dinov3/eval/segmentation/configs/config-ade20k-linear-training.yaml \
-datasets.root=<PATH/TO/DATASET> \
---output-dir <PATH/TO/OUTPUT/DIR>
-```
-
-After the job completes, you will find in the output path directory you specified
-- `segmentation_config.yaml` that contains the config you trained the model with;
-- `model_final.pth`, the final linear head checkpoint at the end of training; and
-- `results-semantic-segmentation.csv` with the final metrics.
-
-### Text alignment on DINOv3 using dino.txt
-
-Text alignment can be done following the method from `dino.txt` aka [DINOv2 Meets Text](https://arxiv.org/abs/2412.16334).
-
-```shell
-PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/text/train_dinotxt.py \
-   --nodes 4 \
-  # An example config for text alignment is here: dinov3/eval/text/configs/dinov3_vitl_text.yaml \ 
-  trainer_config_file="<PATH/TO/DINOv3/TEXT/CONFIG>" \
-  output-dir=<PATH/TO/OUTPUT/DIR>
-```
-Launching the above trains text alignment on 4 nodes with 8 gpus each (32 gpus in total).
-Please note that the text alignment model in the DINOv3 paper was trained on a private dataset and here we have given an example config in ```dinov3/eval/text/configs/dinov3_vitl_text.yaml``` using ```CocoCaptions``` dataset for illustration purposes.
-Please adapt the provided ```CocoCaptions``` dataset class, the dataset can be found [here](https://www.kaggle.com/datasets/nikhil7280/coco-image-caption)  
-
-## License
-
-DINOv3 code and model weights are released under the DINOv3 License. See [LICENSE.md](LICENSE.md) for additional details.
-
-## Contributing
-
-See [contributing](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
-
-## Citing DINOv3
-
-If you find this repository useful, please consider giving a star :star: and citation :t-rex::
-
-```
-@misc{simeoni2025dinov3,
-  title={{DINOv3}},
-  author={Sim{\'e}oni, Oriane and Vo, Huy V. and Seitzer, Maximilian and Baldassarre, Federico and Oquab, Maxime and Jose, Cijo and Khalidov, Vasil and Szafraniec, Marc and Yi, Seungeun and Ramamonjisoa, Micha{\"e}l and Massa, Francisco and Haziza, Daniel and Wehrstedt, Luca and Wang, Jianyuan and Darcet, Timoth{\'e}e and Moutakanni, Th{\'e}o and Sentana, Leonel and Roberts, Claire and Vedaldi, Andrea and Tolan, Jamie and Brandt, John and Couprie, Camille and Mairal, Julien and J{\'e}gou, Herv{\'e} and Labatut, Patrick and Bojanowski, Piotr},
-  year={2025},
-  eprint={2508.10104},
-  archivePrefix={arXiv},
-  primaryClass={cs.CV},
-  url={https://arxiv.org/abs/2508.10104},
-}
-```
+## 4. `run/dinov3_vitlarge_pretrain.yaml` 逐行说明
+
+说明：下面按实际文件行号（`nl -ba run/dinov3_vitlarge_pretrain.yaml`）逐行解释。
+
+- L1 `MODEL:` 模型级配置根节点。
+- L2 `META_ARCHITECTURE: SSLResizeShuffle` 选择训练元架构为 Resize+Shuffle 分支。
+- L3 `DEVICE: cuda` 配置中的目标设备标识；实际运行仍由 `auto_device.py` 自动检测。
+- L4 `WEIGHTS: ''` 初始权重路径，空表示不额外加载。
+- L5 `DTYPE: float32` 模型默认计算 dtype。
+- L6 `compute_precision:` 混合精度/FSDP 精度策略根节点。
+- L7 `param_dtype: bf16` 参数前向/反向主精度设为 bf16。
+- L8 `reduce_dtype: fp32` 梯度规约精度设为 fp32（更稳）。
+- L9 `sharding_strategy: SHARD_GRAD_OP` FSDP 分片策略。
+- L10 `dino:` DINO 分支配置根节点。
+- L11 `loss_weight: 1.0` DINO 损失权重。
+- L12 `global_ignore_diagonal: true` 计算全局对齐时忽略对角项（同位配对）。
+- L13 `head_n_prototypes: 65536` DINO head 原型数 `K`。
+- L14 `head_bottleneck_dim: 256` DINO head bottleneck 维度。
+- L15 `head_norm_last_layer: false` DINO 最后一层不做 norm/weight-norm 约束。
+- L16 `head_nlayers: 3` DINO head MLP 层数。
+- L17 `head_hidden_dim: 2048` DINO head 隐层维度。
+- L18 `koleo_cls_loss_weight: 0.1` CLS KoLeo 正则权重。
+- L19 `koleo_patch_loss_weight: 0.1` Patch KoLeo 正则权重。
+- L20 `koleo_cls_gate_enabled: true` 启用 CLS KoLeo 门控。
+- L21 `koleo_patch_gate_enabled: true` 启用 Patch KoLeo 门控。
+- L22 `koleo_cls_gate_threshold: 0.0` CLS KoLeo 门控阈值。
+- L23 `koleo_patch_gate_threshold: 0.0` Patch KoLeo 门控阈值。
+- L24 `koleo_loss_distributed: false` KoLeo 不做跨卡分布式聚合。
+- L25 `koleo_topk: 1` KoLeo 邻居选择 top-k=1。
+- L26 `koleo_distributed_replicas: 0` 分布式 KoLeo 副本数（0 表示关闭）。
+- L27 `koleo_distributed_loss_group_size: null` 分布式 KoLeo 分组大小，空表示默认。
+- L28 `force_weight_norm: false` 不强制对 head 使用 weight norm。
+- L29 `ibot:` iBOT 分支配置根节点。
+- L30 `loss_weight: 1.0` iBOT 损失权重。
+- L31 `mask_sample_probability: 0.5` 每张图像进入 mask 机制的概率。
+- L32 `mask_ratio_min_max:` mask 比例范围定义。
+- L33 `- 0.1` mask 最小比例 10%。
+- L34 `- 0.5` mask 最大比例 50%。
+- L35 `mask_random_circular_shift: false` 不启用 mask 随机环移。
+- L36 `force_masking_even_with_zero_weight: false` 即使 loss=0 也强制 mask 的开关（这里关闭）。
+- L37 `separate_head: true` iBOT 使用独立 head。
+- L38 `head_n_prototypes: 65536` iBOT head 原型数。
+- L39 `head_bottleneck_dim: 256` iBOT head bottleneck 维度。
+- L40 `head_norm_last_layer: false` iBOT head 最后一层不加 norm。
+- L41 `head_nlayers: 3` iBOT head 层数。
+- L42 `head_hidden_dim: 2048` iBOT head 隐层维度。
+- L43 `gram:` Gram 分支配置根节点。
+- L44 `use_loss: false` 不启用 Gram loss。
+- L45 `compute_stats: false` 不计算 Gram 统计。
+- L46 `train:` 训练流程主配置根节点。
+- L47 `batch_size_per_gpu: 64` 单卡 batch size。
+- L48 `dataset_path: null` 数据集路径留空（通常由 `data.*` 子项给出）。
+- L49 `saveckp_freq: 20` checkpoint 保存频率（按训练内部计数单位）。
+- L50 `seed: 0` 随机种子。
+- L51 `num_workers: 4` DataLoader worker 数。
+- L52 `OFFICIAL_EPOCH_LENGTH: 1000` 每个 epoch 对应的迭代步数定义。
+- L53 `monitor_gradient_norm: false` 关闭梯度范数监控。
+- L54 `chunk_schedule: []` 不启用 chunk 调度。
+- L55 `cache_dataset: true` 启用数据集缓存。
+- L56 `use_teacher_head: true` student 使用 teacher head 目标进行蒸馏。
+- L57 `learn_from_teacher_tokens: false` 不直接从 teacher token 学习。
+- L58 `reshuffle_sampler_perm: true` 每轮重排 sampler 顺序。
+- L59 `centering: sinkhorn_knopp` 使用 Sinkhorn-Knopp 类中心化/分配。
+- L60 `checkpointing: true` 启用激活检查点。
+- L61 `checkpointing_full: false` 不做 full checkpointing，使用选择性策略。
+- L62 `compile: true` 请求 `torch.compile`；在非 CUDA 设备（如 NPU）会自动跳过。
+- L63 `cudagraphs: false` 不启用 CUDA Graphs。
+- L64 `cell_augmentation: false` 关闭细胞增强分支。
+- L65 `cell_augmentation_type: hpa` 细胞增强类型占位配置（当前未启用）。
+- L66 `sharded_eval_checkpoint: false` 评估时不使用分片 checkpoint。
+- L67 `student:` student backbone 配置根节点。
+- L68 `arch: vit_large` student 架构为 ViT-L。
+- L69 `patch_size: 16` patch 大小 16。
+- L70 `drop_path_rate: 0.2` stochastic depth 比例。
+- L71 `layerscale: 1.0e-05` LayerScale 初始化系数。
+- L72 `patch_drop: 0.0` 不丢弃 patch token。
+- L73 `pretrained_weights: ''` student 预训练权重路径为空。
+- L74 `ffn_layer: swiglu64` FFN 类型为 swiglu64。
+- L75 `ffn_ratio: 4` FFN 扩展倍率。
+- L76 `resume_from_teacher_chkpt: ''` 不从 teacher checkpoint 恢复。
+- L77 `qkv_bias: true` QKV 线性层启用 bias。
+- L78 `proj_bias: true` attention 输出投影启用 bias。
+- L79 `ffn_bias: true` FFN 线性层启用 bias。
+- L80 `norm_layer: layernormbf16` 归一化层实现为 bf16 友好版本。
+- L81 `n_storage_tokens: 4` 额外 storage token 数量。
+- L82 `untie_cls_and_patch_norms: false` CLS 与 patch norm 不拆分。
+- L83 `untie_global_and_local_cls_norm: true` global/local CLS norm 拆分。
+- L84 `mask_k_bias: true` mask 相关 K 分支使用 bias。
+- L85 `in_chans: 3` 输入通道数为 RGB 3。
+- L86 `pos_embed_type: rope` 位置编码采用 RoPE。
+- L87 `pos_embed_rope_base: 100` RoPE base 参数。
+- L88 `pos_embed_rope_min_period: null` RoPE 最小周期留空（默认策略）。
+- L89 `pos_embed_rope_max_period: null` RoPE 最大周期留空（默认策略）。
+- L90 `pos_embed_rope_normalize_coords: separate` 坐标归一化策略为 separate。
+- L91 `pos_embed_rope_shift_coords: null` 不启用坐标平移扰动。
+- L92 `pos_embed_rope_jitter_coords: null` 不启用坐标 jitter。
+- L93 `pos_embed_rope_rescale_coords: 2` RoPE 坐标缩放系数为 2。
+- L94 `pos_embed_rope_dtype: bf16` RoPE 计算 dtype 为 bf16。
+- L95 `fp8_enabled: false` 不启用 FP8。
+- L96 `fp8_filter: blocks` FP8 过滤目标（当前无效，因为 FP8 关闭）。
+- L97 `teacher:` teacher 配置根节点。
+- L98 `momentum_teacher: null` teacher 动量由 `schedules.momentum` 接管。
+- L99 `final_momentum_teacher: null` 终止动量由 schedule 控制。
+- L100 `warmup_teacher_temp: null` warmup 温度由 schedule 控制。
+- L101 `teacher_temp: null` teacher 温度由 schedule 控制。
+- L102 `warmup_teacher_temp_epochs: null` warmup 轮次由 schedule 控制。
+- L103 `in_chans: 3` teacher 输入通道数。
+- L104 `distillation:` 额外蒸馏配置根节点。
+- L105 `enabled: false` 关闭单模型蒸馏。
+- L106 `full_cfg_path: ''` 蒸馏配置路径为空。
+- L107 `checkpoint_path: ''` 蒸馏权重路径为空。
+- L108 `multidistillation:` 多蒸馏配置根节点。
+- L109 `enabled: false` 关闭多蒸馏。
+- L110 `hrft:` HRFT 配置根节点。
+- L111 `enabled: false` 关闭 HRFT。
+- L112 `checkpoint_path: ''` HRFT 权重路径为空。
+- L113 `optim:` 优化器配置根节点。
+- L114 `epochs: 1000` 总训练 epoch。
+- L115 `optimizer: adamw` 优化器为 AdamW。
+- L116 `weight_decay: null` 旧版 WD 配置留空（使用 `schedules.weight_decay`）。
+- L117 `weight_decay_end: null` 旧版 WD 终值留空。
+- L118 `lr: null` 旧版 LR 配置留空（使用 `schedules.lr`）。
+- L119 `warmup_epochs: null` 旧版 warmup 配置留空。
+- L120 `min_lr: null` 旧版最小 LR 留空。
+- L121 `schedule_trunc_extra: null` 不使用旧版截断调度。
+- L122 `clip_grad: 30.0` 梯度裁剪阈值。
+- L123 `freeze_last_layer_epochs: null` 旧版 last-layer freeze 留空（使用 `schedules.lr.freeze_last_layer_epochs`）。
+- L124 `scaling_rule: sqrt_wrt_1024` 按全局 batch 相对 1024 的平方根缩放 LR。
+- L125 `patch_embed_lr_mult: 0.2` patch-embed 层 LR 乘子。
+- L126 `dino_head_wd_multiplier: 1.0` DINO head 的 WD 乘子。
+- L127 `dino_head_lr_multiplier: 0.8` DINO head 的 LR 乘子。
+- L128 `layerwise_decay: 0.98` 按层衰减 LR。
+- L129 `multi_tensor_optim: true` 启用 multi-tensor 优化路径。
+- L130 `dump_fsdp_weights_path: ''` FSDP 权重导出路径为空。
+- L131 `adamw_beta1: 0.9` AdamW beta1。
+- L132 `adamw_beta2: 0.99` AdamW beta2。
+- L133 `crops:` 数据增强裁剪配置根节点。
+- L134 `global_crops_scale:` global crop 尺度范围定义。
+- L135 `- 0.32` global crop 最小面积比例。
+- L136 `- 1.0` global crop 最大面积比例。
+- L137 `local_crops_number: 8` local crop 数量。
+- L138 `local_crops_scale:` local crop 尺度范围定义。
+- L139 `- 0.05` local crop 最小面积比例。
+- L140 `- 0.32` local crop 最大面积比例。
+- L141 `global_crops_size: 224` global crop 输出尺寸。
+- L142 `local_crops_size: 96` local crop 输出尺寸。
+- L143 `localcrops_subset_of_globalcrops: false` local crop 不限制为 global 子集。
+- L144 `share_color_jitter: false` 不共享 color jitter 参数。
+- L145 `horizontal_flips: false` 关闭水平翻转。
+- L146 `rgb_mean:` 归一化均值列表。
+- L147 `- 0.485` R 通道均值。
+- L148 `- 0.456` G 通道均值。
+- L149 `- 0.406` B 通道均值。
+- L150 `rgb_std:` 归一化标准差列表。
+- L151 `- 0.229` R 通道标准差。
+- L152 `- 0.224` G 通道标准差。
+- L153 `- 0.225` B 通道标准差。
+- L154 `use_resize_shuffle_augmentor: true` 启用 resize-shuffle 增强。
+- L155 `resize_shuffle_augmentor_switch: null` 无额外增强切换策略（默认）。
+- L156 `checkpointing:` checkpoint 保留策略根节点。
+- L157 `period: 1000` 保存周期。
+- L158 `max_to_keep: 10` 最多保留最近 10 个。
+- L159 `keep_every: 50000` 每隔 50000 step 做长期保留。
+- L160 `save_student: true` checkpoint 中保存 student。
+- L161 `schedules:` 新版调度器配置根节点。
+- L162 `lr:` 学习率调度配置根节点。
+- L163 `start: 0` LR 初值。
+- L164 `peak: 5.0e-05` LR 峰值。
+- L165 `end: 5.0e-06` LR 终值。
+- L166 `warmup_epochs: 1` LR warmup 轮数。
+- L167 `freeze_last_layer_epochs: 1` 末层冻结轮数。
+- L168 `weight_decay:` WD 调度配置根节点。
+- L169 `start: 0.04` WD 初值。
+- L170 `peak: 0.04` WD 峰值。
+- L171 `end: 0.04` WD 终值。
+- L172 `warmup_epochs: 0` WD warmup 轮数。
+- L173 `teacher_temp:` teacher 温度调度根节点。
+- L174 `start: 0.04` teacher 温度初值。
+- L175 `peak: 0.07` teacher 温度峰值。
+- L176 `end: 0.07` teacher 温度终值。
+- L177 `warmup_epochs: 100` teacher 温度 warmup 轮数。
+- L178 `momentum:` EMA 动量调度根节点。
+- L179 `start: 0.994` 动量初值。
+- L180 `peak: 0.994` 动量峰值。
+- L181 `end: 0.994` 动量终值。
+- L182 `warmup_epochs: 0` 动量 warmup 轮数。
+- L183 `data:` 数据源配置根节点。
+- L184 `imagenet_1k:` Imagenet-1K 数据集子配置。
+- L185 `txt_path: /root/data/imagenet_1k/data_new/imagenet_1k.txt` 样本列表文件路径。
+- L186 `dataset_ratio: 1.0` 数据采样比例（1.0 表示全量）。
+- L187 `resize_shuffle_augmentor:` ResizeShuffle 额外损失配置根节点。
+- L188 `resize_paste_loss_weight:` resize-paste loss 权重调度根节点。
+- L189 `start: 0.0` resize-paste loss 初值。
+- L190 `peak: 0.5` resize-paste loss 峰值。
+- L191 `end: 0.5` resize-paste loss 终值。
+- L192 `zero_epochs: 50` 前 50 轮置零。
+- L193 `warmup_epochs: 50` 后续 50 轮 warmup。
+- L194 `patch_shuffle_loss_weight:` patch-shuffle loss 权重调度根节点。
+- L195 `start: 0.0` patch-shuffle loss 初值。
+- L196 `peak: 1.0` patch-shuffle loss 峰值。
+- L197 `end: 1.0` patch-shuffle loss 终值。
+- L198 `zero_epochs: 50` patch-shuffle 前 50 轮置零。
+- L199 `warmup_epochs: 50` patch-shuffle warmup 轮数。
+- L200 `patch_shuffle_patch_weight: 1.0` patch 分支权重。
+- L201 `patch_shuffle_cls_weight: 1.0` CLS 分支权重。
+- L202 `patch_shuffle_patch_probability: 0.5` 进入 patch-shuffle 的概率。
+- L203 `patch_shuffle_patch_min_max:` patch-shuffle 比例范围定义。
+- L204 `- 0.05` patch-shuffle 最小比例。
+- L205 `- 0.15` patch-shuffle 最大比例。
+- L206 `use_all_shift_mask: true` 使用全量 shift mask 策略。
+- L207 `bridge_patchshuffle_weight:` bridge 的 patchshuffle 权重调度根节点。
+- L208 `start: 0.0` bridge-patchshuffle 初值。
+- L209 `peak: 0.25` bridge-patchshuffle 峰值。
+- L210 `end: 0.25` bridge-patchshuffle 终值。
+- L211 `zero_epochs: 50` bridge-patchshuffle 前 50 轮置零。
+- L212 `warmup_epochs: 50` bridge-patchshuffle warmup 轮数。
+- L213 `bridge_global_weight:` bridge 的 global 权重调度根节点。
+- L214 `start: 0.0` bridge-global 初值。
+- L215 `peak: 0.25` bridge-global 峰值。
+- L216 `end: 0.25` bridge-global 终值。
+- L217 `zero_epochs: 50` bridge-global 前 50 轮置零。
+- L218 `warmup_epochs: 50` bridge-global warmup 轮数。
+- L219 `patch_size: 16` resize-shuffle/bridge 分支使用的 patch 大小。
+- L220 `dtch:` DTCH 配置根节点。
+- L221 `enabled: true` 启用 DTCH 机制。
+- L222 `patch_hist_cache: 40000` patch 历史缓存统计容量。
+- L223 `cls_hist_cache: 40000` CLS 历史缓存统计容量。
+
+## 5. 备注
+
+- 若后续将仓库正式切到新远程（`dino_bridge`），建议把训练/评估脚本中的绝对路径（如 `/mnt/seek/...`）改成相对路径或环境变量，便于跨机器复用。
+- 如果需要，我可以继续补一版 `README_en.md`（英文版）和一份最小可复现实验清单（train/eval/ckpt 约定）。
