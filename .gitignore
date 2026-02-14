@@ -16,3 +16,7 @@ dist/
 
 # Ignore vscode directory
 .vscode/
+
+# Training artifacts
+run/train_imagenet_1k_22/logs_out/
+run/train_imagenet_1k_22/logs_train/
