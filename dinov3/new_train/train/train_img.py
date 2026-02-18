@@ -634,8 +634,9 @@ def do_train(cfg, model, resume=False):
             group=distributed.get_process_subgroup(),
         )
         total_loss = total_loss_all_ranks.mean()
+        metrics_reduce_dtype = torch.float32 if total_loss.device.type == "npu" else torch.float64
         metrics_values = torch.stack(
-            [torch.as_tensor(v, dtype=torch.float64, device=total_loss.device).detach() for v in metrics_dict.values()]
+            [torch.as_tensor(v, dtype=metrics_reduce_dtype, device=total_loss.device).detach() for v in metrics_dict.values()]
         )
         torch.distributed.all_reduce(
             metrics_values,

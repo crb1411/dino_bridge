@@ -40,9 +40,16 @@ def _get_world_size():
     return dist.get_world_size() if _is_dist_initialized() else 1
 
 
-def _all_reduce(tensor):
-    if _is_dist_initialized():
-        dist.all_reduce(tensor)
+def _all_reduce(tensor, op=dist.ReduceOp.SUM):
+    if not _is_dist_initialized():
+        return
+    # HCCL on NPU does not support float64 all_reduce. Reduce in float32 and cast back.
+    if tensor.is_floating_point() and tensor.dtype == torch.float64 and tensor.device.type == "npu":
+        reduced = tensor.to(dtype=torch.float32)
+        dist.all_reduce(reduced, op=op)
+        tensor.copy_(reduced.to(dtype=torch.float64))
+        return
+    dist.all_reduce(tensor, op=op)
 
 
 def _is_main_process():
@@ -144,7 +151,7 @@ class DTCH_BALANCE(nn.Module):
         dt_exp_power: Optional[float] = None,
         balance_beta: float = 1,
         history_update: str = "cache",
-        history_cache_recompute_interval: int = 10000,
+        history_cache_recompute_interval: int = 5000,
     ):
         super().__init__()
         self.K = K
@@ -841,7 +848,7 @@ class DTCH_BALANCE(nn.Module):
             self.history_Q = ((scale - b_local) / scale) * self.history_Q + sum_Q_local_f64
             return
         self._ensure_history_Q(Q_local)
-        sum_Q_local = torch.sum(Q_local, dim=1)
+        sum_Q_local = torch.sum(Q_local, dim=1).clamp(min=1e-2)
         sum_Q_local_f64 = sum_Q_local.to(dtype=self.history_Q.dtype)
         if self._history_cache is None or self._history_cache_capacity <= 0:
             self.history_Q = sum_Q_local_f64
