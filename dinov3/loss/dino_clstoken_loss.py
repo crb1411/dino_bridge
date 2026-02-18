@@ -19,7 +19,8 @@ class DINOLoss(nn.Module):
         out_dim,
         student_temp=0.1,
         center_momentum=0.9,
-        hist_cache=None
+        hist_cache=None,
+        neg_alpha=1.0,
     ):
         super().__init__()
         self.student_temp = student_temp
@@ -33,7 +34,8 @@ class DINOLoss(nn.Module):
             self.sinkhorn_knopp_teacher = DTCH_BALANCE(K=out_dim, history_cache_size=hist_cache)
         else:
             self.sinkhorn_knopp_teacher = DTCH_BALANCE(K=out_dim)
-
+        self.neg_alpha = neg_alpha
+        
     def init_weights(self) -> None:
         self.center.zero_()
 
@@ -74,34 +76,76 @@ class DINOLoss(nn.Module):
     #     Q *= B  # the colomns must sum to 1 so that Q is an assignment
     #     return Q.t()
 
+    # def forward(self, student_logits, teacher_probs, ignore_diagonal=False):
+    #     """
+    #     Cross-entropy between softmax outputs of the teacher and student networks.
+    #     student_logits: [student crops, batch, prototypes]
+    #     teacher_probs:  [teacher crops, batch, prototypes] must sum to 1 over the last dim
+
+    #     loss = 0
+    #     count = 0
+    #     for each sample `b` in the batch:
+    #         for each student crop `s` of this sample:
+    #             for each teacher crop `t` of this sample:
+    #                 if ignore_diagonal and s == t:
+    #                     continue
+    #                 loss += cross_entropy(softmax(student_logits[s, b] / student_temp), teacher_probs[t, b])
+    #                 count += 1
+    #     return loss / count
+    #     """
+    #     student_crops, B, K = student_logits.shape
+    #     teacher_crops, _, _ = teacher_probs.shape
+    #     student_logits = F.log_softmax(student_logits.float() / self.student_temp, dim=-1)
+    #     if not ignore_diagonal:
+    #         loss = -torch.einsum("s b k, t b k -> ", student_logits, teacher_probs)
+    #         return loss / (B * student_crops * teacher_crops)
+    #     else:
+    #         loss = -torch.einsum("s b k, t b k -> s t", student_logits, teacher_probs)
+    #         min_st = min(student_crops, teacher_crops)
+    #         loss = torch.diagonal_scatter(loss, loss.new_zeros(min_st))
+    #         return loss.sum() / (B * student_crops * teacher_crops - B * min_st)
+
     def forward(self, student_logits, teacher_probs, ignore_diagonal=False):
         """
-        Cross-entropy between softmax outputs of the teacher and student networks.
-        student_logits: [student crops, batch, prototypes]
-        teacher_probs:  [teacher crops, batch, prototypes] must sum to 1 over the last dim
-
-        loss = 0
-        count = 0
-        for each sample `b` in the batch:
-            for each student crop `s` of this sample:
-                for each teacher crop `t` of this sample:
-                    if ignore_diagonal and s == t:
-                        continue
-                    loss += cross_entropy(softmax(student_logits[s, b] / student_temp), teacher_probs[t, b])
-                    count += 1
-        return loss / count
+        Returns:
+            {
+                "pos": original CE loss (teacher_probs vs softmax(student_logits/student_temp)),
+                "neg": dual CE loss (p_minus vs softmax(-student_logits/student_temp))
+            }
         """
-        student_crops, B, K = student_logits.shape
-        teacher_crops, _, _ = teacher_probs.shape
-        student_logits = F.log_softmax(student_logits.float() / self.student_temp, dim=-1)
+        S, B, K = student_logits.shape
+        T, _, _ = teacher_probs.shape
+
+        # ---- hyperparams for neg branch (safe defaults) ----
+        alpha = getattr(self, "neg_alpha", 1.0)   # 1.0 = hardest; try 0.3~0.7 for stability
+        eps   = getattr(self, "neg_eps", 1e-25)
+
+        # ---- student log-probs ----
+        logq_pos = F.log_softmax(student_logits.float() / self.student_temp, dim=-1)
+        logq_neg = F.log_softmax((-student_logits.float()) / self.student_temp, dim=-1)
+
+        # ---- teacher p_minus constructed only from probs ----
+        p = teacher_probs.float().clamp_min(eps)          # [T,B,K]
+        w = p.pow(-alpha)                                 # (p+eps)^(-alpha)
+        p_minus = w / w.sum(dim=-1, keepdim=True)         # normalize over K
+
         if not ignore_diagonal:
-            loss = -torch.einsum("s b k, t b k -> ", student_logits, teacher_probs)
-            return loss / (B * student_crops * teacher_crops)
+            pos = -torch.einsum("s b k, t b k -> ", logq_pos, teacher_probs)
+            neg = -torch.einsum("s b k, t b k -> ", logq_neg, p_minus)
+            denom = (B * S * T)
+            return {"pos": pos / denom, "neg": neg / denom}
+
         else:
-            loss = -torch.einsum("s b k, t b k -> s t", student_logits, teacher_probs)
-            min_st = min(student_crops, teacher_crops)
-            loss = torch.diagonal_scatter(loss, loss.new_zeros(min_st))
-            return loss.sum() / (B * student_crops * teacher_crops - B * min_st)
+            pos_st = -torch.einsum("s b k, t b k -> s t", logq_pos, teacher_probs)  # [S,T]
+            neg_st = -torch.einsum("s b k, t b k -> s t", logq_neg, p_minus)        # [S,T]
+
+            min_st = min(S, T)
+            pos_st = torch.diagonal_scatter(pos_st, pos_st.new_zeros(min_st))
+            neg_st = torch.diagonal_scatter(neg_st, neg_st.new_zeros(min_st))
+
+            denom = (B * S * T - B * min_st)
+            return {"pos": pos_st.sum() / denom, "neg": neg_st.sum() / denom}
+
 
     @torch.no_grad()
     def update_center(self, teacher_output):

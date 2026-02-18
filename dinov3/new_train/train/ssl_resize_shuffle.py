@@ -134,15 +134,23 @@ class SSLResizeShuffle(SSLMetaArch):
         patch_hist_cache = getattr(cfg.dtch, "patch_hist_cache", None)
 
         def _build_dino_loss():
-            return DINOLoss(self.dino_out_dim, hist_cache=cls_hist_cache)
+            return DINOLoss(self.dino_out_dim, hist_cache=cls_hist_cache, neg_alpha=self.dino_neg_alpha)
 
         self.resize_paste_loss = _build_dino_loss()
         self.resize_paste_loss_resized = _build_dino_loss()
         self.patchshuffle_cls_loss = _build_dino_loss()
         self.patchshuffle_cls_loss_resized = _build_dino_loss()
 
-        self.patchshuffle_patch_loss = iBOTPatchLoss(self.patchshuffle_out_dim, hist_cache=patch_hist_cache)
-        self.patchshuffle_patch_loss_resized = iBOTPatchLoss(self.patchshuffle_out_dim, hist_cache=patch_hist_cache)
+        self.patchshuffle_patch_loss = iBOTPatchLoss(
+            self.patchshuffle_out_dim,
+            hist_cache=patch_hist_cache,
+            neg_alpha=self.ibot_neg_alpha,
+        )
+        self.patchshuffle_patch_loss_resized = iBOTPatchLoss(
+            self.patchshuffle_out_dim,
+            hist_cache=patch_hist_cache,
+            neg_alpha=self.ibot_neg_alpha,
+        )
 
         bridge_patchshuffle_schedule = self._resize_shuffle_weight_schedules.get("bridge_patchshuffle")
         bridge_global_schedule = self._resize_shuffle_weight_schedules.get("bridge_global")
@@ -291,6 +299,16 @@ class SSLResizeShuffle(SSLMetaArch):
             logger.warning("resize_shuffle teacher_temp missing; using %s", fallback)
             return float(fallback)
         return float(temp)
+
+    def _combine_dino_loss(self, loss_out):
+        if isinstance(loss_out, dict):
+            return loss_out["pos"] + self.dino_neg_lambda * loss_out["neg"]
+        return loss_out
+
+    def _combine_ibot_loss(self, loss_out):
+        if isinstance(loss_out, dict):
+            return loss_out["pos"] + self.ibot_neg_lambda * loss_out["neg"]
+        return loss_out
 
     def _get_bridge_patch_mlp(self):
         if "bridge_patch_mlp" not in self.student:
@@ -457,8 +475,10 @@ class SSLResizeShuffle(SSLMetaArch):
             )
             if merged_teacher_targets is None:
                 return None
-            merged_loss = self.patchshuffle_cls_loss(
-                merged_student_logits.unsqueeze(0), merged_teacher_targets.unsqueeze(0)
+            merged_loss = self._combine_dino_loss(
+                self.patchshuffle_cls_loss(
+                    merged_student_logits.unsqueeze(0), merged_teacher_targets.unsqueeze(0)
+                )
             )
             if not torch.isfinite(merged_loss):
                 return None
@@ -474,8 +494,10 @@ class SSLResizeShuffle(SSLMetaArch):
                 branch=branch_prefix,
             )
             if teacher_r_cls_targets_aligned is not None:
-                loss_resized = self.patchshuffle_cls_loss_resized(
-                    bridge_logits_resized.unsqueeze(0), teacher_r_cls_targets_aligned.unsqueeze(0)
+                loss_resized = self._combine_dino_loss(
+                    self.patchshuffle_cls_loss_resized(
+                        bridge_logits_resized.unsqueeze(0), teacher_r_cls_targets_aligned.unsqueeze(0)
+                    )
                 )
                 if not torch.isfinite(loss_resized):
                     loss_resized = None
@@ -487,8 +509,10 @@ class SSLResizeShuffle(SSLMetaArch):
                 branch=branch_prefix,
             )
             if teacher_o_cls_targets_aligned is not None:
-                loss_original = self.patchshuffle_cls_loss(
-                    bridge_logits_original.unsqueeze(0), teacher_o_cls_targets_aligned.unsqueeze(0)
+                loss_original = self._combine_dino_loss(
+                    self.patchshuffle_cls_loss(
+                        bridge_logits_original.unsqueeze(0), teacher_o_cls_targets_aligned.unsqueeze(0)
+                    )
                 )
                 if not torch.isfinite(loss_original):
                     loss_original = None
@@ -947,9 +971,15 @@ class SSLResizeShuffle(SSLMetaArch):
             logger_freq=logger_freq,
             logger_loss="resize_paste_original_cls",
         )
-        loss_resize_paste = self.resize_paste_loss_resized(
-            student_cls_logits_resized.unsqueeze(0), teacher_r_targets.unsqueeze(0)
-        ) + self.resize_paste_loss(student_cls_logits_original.unsqueeze(0), teacher_o_targets.unsqueeze(0))
+        loss_resize_paste_resized = self._combine_dino_loss(
+            self.resize_paste_loss_resized(
+                student_cls_logits_resized.unsqueeze(0), teacher_r_targets.unsqueeze(0)
+            )
+        )
+        loss_resize_paste_original = self._combine_dino_loss(
+            self.resize_paste_loss(student_cls_logits_original.unsqueeze(0), teacher_o_targets.unsqueeze(0))
+        )
+        loss_resize_paste = loss_resize_paste_resized + loss_resize_paste_original
         return loss_resize_paste
 
     def _loss_patchshuffle_ibot_from_resize_shuffle(
@@ -997,10 +1027,12 @@ class SSLResizeShuffle(SSLMetaArch):
                     logger_freq=logger_freq,
                     logger_loss="raw_patch_resized",
                 )
-                loss_resized = self.patchshuffle_patch_loss_resized.forward_masked(
-                    student_patch_logits_resized,
-                    teacher_r_patch_targets,
-                    student_masks_flat=patch_masks_resized,
+                loss_resized = self._combine_ibot_loss(
+                    self.patchshuffle_patch_loss_resized.forward_masked(
+                        student_patch_logits_resized,
+                        teacher_r_patch_targets,
+                        student_masks_flat=patch_masks_resized,
+                    )
                 )
                 patch_losses.append(loss_resized)
             else:
@@ -1030,10 +1062,12 @@ class SSLResizeShuffle(SSLMetaArch):
                     logger_freq=logger_freq,
                     logger_loss="raw_patch_original",
                 )
-                loss_original = self.patchshuffle_patch_loss.forward_masked(
-                    student_patch_logits_original,
-                    teacher_o_patch_targets,
-                    student_masks_flat=patch_masks_original,
+                loss_original = self._combine_ibot_loss(
+                    self.patchshuffle_patch_loss.forward_masked(
+                        student_patch_logits_original,
+                        teacher_o_patch_targets,
+                        student_masks_flat=patch_masks_original,
+                    )
                 )
                 patch_losses.append(loss_original)
             else:
@@ -1062,9 +1096,15 @@ class SSLResizeShuffle(SSLMetaArch):
             return None
         teacher_r_cls_targets, teacher_o_cls_targets = teacher_cls_targets
 
-        cls_loss = self.patchshuffle_cls_loss_resized(
-            student_cls_logits_resized.unsqueeze(0), teacher_r_cls_targets.unsqueeze(0)
-        ) + self.patchshuffle_cls_loss(student_cls_logits_original.unsqueeze(0), teacher_o_cls_targets.unsqueeze(0))
+        cls_loss_resized = self._combine_dino_loss(
+            self.patchshuffle_cls_loss_resized(
+                student_cls_logits_resized.unsqueeze(0), teacher_r_cls_targets.unsqueeze(0)
+            )
+        )
+        cls_loss_original = self._combine_dino_loss(
+            self.patchshuffle_cls_loss(student_cls_logits_original.unsqueeze(0), teacher_o_cls_targets.unsqueeze(0))
+        )
+        cls_loss = cls_loss_resized + cls_loss_original
         if patch_loss is None:
             patch_loss = cls_loss.new_zeros(())
         return patch_loss, cls_loss

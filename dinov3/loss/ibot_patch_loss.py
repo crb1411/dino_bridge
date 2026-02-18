@@ -59,10 +59,20 @@ def lossfunc(t, s, temp):  # noqa: F811
 
 
 class iBOTPatchLoss(nn.Module):
-    def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9, hist_cache=None):
+    def __init__(
+        self,
+        patch_out_dim,
+        student_temp=0.1,
+        center_momentum=0.9,
+        hist_cache=None,
+        neg_alpha=1.0,
+        neg_eps=1e-25,
+    ):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
+        self.neg_alpha = neg_alpha
+        self.neg_eps = neg_eps
         self.register_buffer("center", torch.full((1, 1, patch_out_dim), math.nan))
         self.updated = True
         self.reduce_handle = None
@@ -105,10 +115,16 @@ class iBOTPatchLoss(nn.Module):
         n_masked_patches=None,
         masks_weight=None,
     ):
-        t = teacher_patch_tokens_masked
-        s = student_patch_tokens_masked
-        # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
-        loss = lossfunc(t, s, self.student_temp)
+        t = teacher_patch_tokens_masked.float()
+        s = student_patch_tokens_masked.float()
+        pos_loss = lossfunc(t, s, self.student_temp)
+
+        logq_neg = F.log_softmax((-s) / self.student_temp, dim=-1)
+        p = t.clamp_min(self.neg_eps)
+        p_minus = p.pow(-self.neg_alpha)
+        p_minus = p_minus / p_minus.sum(dim=-1, keepdim=True)
+        neg_loss = torch.sum(p_minus * logq_neg, dim=-1)
+
         if masks_weight is None:
             masks_weight = (
                 (1 / student_masks_flat.sum(-1).clamp(min=1.0))
@@ -116,9 +132,15 @@ class iBOTPatchLoss(nn.Module):
                 .expand_as(student_masks_flat)[student_masks_flat]
             )
         if n_masked_patches is not None:
-            loss = loss[:n_masked_patches]
-        loss = loss * masks_weight
-        return -loss.sum() / student_masks_flat.shape[0]
+            pos_loss = pos_loss[:n_masked_patches]
+            neg_loss = neg_loss[:n_masked_patches]
+        pos_loss = pos_loss * masks_weight
+        neg_loss = neg_loss * masks_weight
+
+        return {
+            "pos": -pos_loss.sum() / student_masks_flat.shape[0],
+            "neg": -neg_loss.sum() / student_masks_flat.shape[0],
+        }
 
     @torch.no_grad()
     def update_center(self, teacher_patch_tokens):

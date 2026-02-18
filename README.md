@@ -286,8 +286,3 @@ export MASTER_PORT=40028
 - L221 `enabled: true` 启用 DTCH 机制。
 - L222 `patch_hist_cache: 40000` patch 历史缓存统计容量。
 - L223 `cls_hist_cache: 40000` CLS 历史缓存统计容量。
-
-## 5. 备注
-
-- 若后续将仓库正式切到新远程（`dino_bridge`），建议把训练/评估脚本中的绝对路径（如 `/mnt/seek/...`）改成相对路径或环境变量，便于跨机器复用。
-- 如果需要，我可以继续补一版 `README_en.md`（英文版）和一份最小可复现实验清单（train/eval/ckpt 约定）。

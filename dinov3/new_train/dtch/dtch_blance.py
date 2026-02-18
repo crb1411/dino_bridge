@@ -848,7 +848,7 @@ class DTCH_BALANCE(nn.Module):
             self.history_Q = ((scale - b_local) / scale) * self.history_Q + sum_Q_local_f64
             return
         self._ensure_history_Q(Q_local)
-        sum_Q_local = torch.sum(Q_local, dim=1).clamp(min=1e-2)
+        sum_Q_local = torch.sum(Q_local, dim=1).clamp(min=1e-10)
         sum_Q_local_f64 = sum_Q_local.to(dtype=self.history_Q.dtype)
         if self._history_cache is None or self._history_cache_capacity <= 0:
             self.history_Q = sum_Q_local_f64

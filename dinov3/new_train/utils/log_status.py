@@ -71,7 +71,7 @@ def log_last_row_stats(
     enabled: bool = True,
     name_width: int = DEFAULT_NAME_WIDTH,
     num_width: int = DEFAULT_NUM_WIDTH,
-    value_fmt: str = ".4f",
+    value_fmt: str = ".4e",
     tag: str = "",
 ) -> None:
     if not enabled:

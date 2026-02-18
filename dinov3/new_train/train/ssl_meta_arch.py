@@ -72,6 +72,10 @@ class SSLMetaArch(nn.Module):
         logger.info(f"OPTIONS -- DINO -- head_hidden_dim: {cfg.dino.head_hidden_dim}")
         logger.info(f"OPTIONS -- DINO -- head_norm_last_layer: {cfg.dino.head_norm_last_layer}")
         logger.info(f"OPTIONS -- DINO -- cls_hist_cache: {cfg.dtch.cls_hist_cache}")
+        self.dino_neg_lambda = float(getattr(cfg.dino, "neg_lambda", 0.0))
+        self.dino_neg_alpha = float(getattr(cfg.dino, "neg_alpha", 1.0))
+        logger.info(f"OPTIONS -- DINO -- neg_lambda: {self.dino_neg_lambda}")
+        logger.info(f"OPTIONS -- DINO -- neg_alpha: {self.dino_neg_alpha}")
         dino_head_class = partial(
             DINOHead,
             in_dim=embed_dim,
@@ -86,6 +90,7 @@ class SSLMetaArch(nn.Module):
         self.dino_loss = DINOLoss(
             self.dino_out_dim,
             hist_cache=cfg.dtch.cls_hist_cache,
+            neg_alpha=self.dino_neg_alpha,
         )
 
         logger.info("OPTIONS -- KOLEO")
@@ -148,6 +153,10 @@ class SSLMetaArch(nn.Module):
         logger.info(f"OPTIONS -- IBOT -- head_hidden_dim: {cfg.ibot.head_hidden_dim}")
         logger.info(f"OPTIONS -- IBOT -- head_norm_last_layer: {cfg.ibot.head_norm_last_layer}")
         logger.info(f"OPTIONS -- IBOT -- patch_hist_cache: {cfg.dtch.patch_hist_cache}")
+        self.ibot_neg_lambda = float(getattr(cfg.ibot, "neg_lambda", self.dino_neg_lambda))
+        self.ibot_neg_alpha = float(getattr(cfg.ibot, "neg_alpha", self.dino_neg_alpha))
+        logger.info(f"OPTIONS -- IBOT -- neg_lambda: {self.ibot_neg_lambda}")
+        logger.info(f"OPTIONS -- IBOT -- neg_alpha: {self.ibot_neg_alpha}")
         ibot_head_class = partial(
             DINOHead,
             in_dim=embed_dim,
@@ -161,6 +170,7 @@ class SSLMetaArch(nn.Module):
         self.ibot_patch_loss = iBOTPatchLoss(
             cfg.ibot.head_n_prototypes,
             hist_cache=cfg.dtch.patch_hist_cache,
+            neg_alpha=self.ibot_neg_alpha,
         )
 
         # Build student and teacher models
@@ -657,12 +667,25 @@ class SSLMetaArch(nn.Module):
         dino_local_scale = dino_local_terms / (dino_global_terms + dino_local_terms)
 
         # DINO local loss: compare post-head CLS tokens: student(local crops) vs. teacher(global crops)
-        dino_local_crops_loss = self.dino_loss(
+        dino_local_out = self.dino_loss(
             student_logits=student_local["cls_after_head"],
             teacher_probs=teacher_global["cls_centered"],
         )
+        if isinstance(dino_local_out, dict):
+            dino_local_pos = dino_local_out["pos"]
+            dino_local_neg = dino_local_out["neg"]
+        else:
+            dino_local_pos = dino_local_out
+            dino_local_neg = dino_local_pos.new_zeros(())
+        dino_local_crops_loss = dino_local_pos + self.dino_neg_lambda * dino_local_neg
         if logger_freq > 0 and iteration % logger_freq == 0:
-            logger.info(f'dino_local_crops_loss: {dino_local_crops_loss}')
+            logger.info(
+                "dino_local_crops_loss: %s (pos=%s, neg=%s, lambda=%s)",
+                dino_local_crops_loss.item(),
+                dino_local_pos.item(),
+                dino_local_neg.item(),
+                self.dino_neg_lambda,
+            )
             log_last_row_stats(
                 student_global["cls_after_head"].flatten(0, 1),
                 5,
@@ -672,12 +695,19 @@ class SSLMetaArch(nn.Module):
                 torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :]/0.1, dim=0),
                 5,
                 "dino_local_student_softmax",
+                value_fmt=".3e",
+                num_width=11,
             )
             log_last_row_stats(
                 teacher_global["cls_centered"].flatten(0, 1),
                 5,
                 "global_teacher_centered",
+                value_fmt=".3e",
+                num_width=11,
             )
+        loss_dict["dino_local_pos"] = dino_local_pos
+        loss_dict["dino_local_neg"] = dino_local_neg
+        loss_dict["dino_local_neg_lambda"] = self.dino_neg_lambda
         loss_dict["dino_local_crops_loss"] = dino_local_crops_loss
 
         # Reweighting of DINO loss
@@ -690,13 +720,26 @@ class SSLMetaArch(nn.Module):
         loss_accumulator += self.dino_loss_weight * dino_local_scale * local_weight * dino_local_crops_loss
 
         # DINO global loss: compare post-head CLS tokens: student(global crops) vs. teacher(global crops)
-        dino_global_crops_loss = self.dino_loss(
+        dino_global_out = self.dino_loss(
             student_logits=student_global["cls_after_head"],
             teacher_probs=teacher_global["cls_centered"],
             ignore_diagonal=self.dino_global_ignore_diagonal,
         )
+        if isinstance(dino_global_out, dict):
+            dino_global_pos = dino_global_out["pos"]
+            dino_global_neg = dino_global_out["neg"]
+        else:
+            dino_global_pos = dino_global_out
+            dino_global_neg = dino_global_pos.new_zeros(())
+        dino_global_crops_loss = dino_global_pos + self.dino_neg_lambda * dino_global_neg
         if logger_freq > 0 and iteration % logger_freq == 0:
-            logger.info(f"dino_global_crops_loss: {dino_global_crops_loss}")
+            logger.info(
+                "dino_global_crops_loss: %s (pos=%s, neg=%s, lambda=%s)",
+                dino_global_crops_loss.item(),
+                dino_global_pos.item(),
+                dino_global_neg.item(),
+                self.dino_neg_lambda,
+            )
             log_last_row_stats(
                 student_global["cls_after_head"].flatten(0, 1),
                 5,
@@ -706,12 +749,19 @@ class SSLMetaArch(nn.Module):
                 torch.softmax(student_global["cls_after_head"].flatten(0, 1)[-1, :]/0.1, dim=0),
                 5,
                 "dino_global_student_softmax",
+                value_fmt=".3e",
+                num_width=11,
             )
             log_last_row_stats(
                 teacher_global["cls_centered"].flatten(0, 1),
                 5,
                 "global_teacher_centered",
+                value_fmt=".3e",
+                num_width=11,
             )
+        loss_dict["dino_global_pos"] = dino_global_pos
+        loss_dict["dino_global_neg"] = dino_global_neg
+        loss_dict["dino_global_neg_lambda"] = self.dino_neg_lambda
         loss_dict["dino_global_crops_loss"] = dino_global_crops_loss
         loss_accumulator += self.dino_loss_weight * dino_global_scale * dino_global_crops_loss
 
@@ -745,15 +795,28 @@ class SSLMetaArch(nn.Module):
         )
 
         # IBOT loss
-        ibot_patch_loss = self.ibot_patch_loss.forward_masked(
+        ibot_patch_out = self.ibot_patch_loss.forward_masked(
             student_global["masked_patch_after_head"],
             teacher_global["masked_patch_centered"],
             student_masks_flat=masks,
             n_masked_patches=mask_indices_list.shape[0],
             masks_weight=masks_weight,
         )
+        if isinstance(ibot_patch_out, dict):
+            ibot_patch_pos = ibot_patch_out["pos"]
+            ibot_patch_neg = ibot_patch_out["neg"]
+        else:
+            ibot_patch_pos = ibot_patch_out
+            ibot_patch_neg = ibot_patch_pos.new_zeros(())
+        ibot_patch_loss = ibot_patch_pos + self.ibot_neg_lambda * ibot_patch_neg
         if logger_freq > 0 and iteration % logger_freq == 0:
-            logger.info(f"ibot_patch_loss: {ibot_patch_loss}")
+            logger.info(
+                "ibot_patch_loss: %s (pos=%s, neg=%s, lambda=%s)",
+                ibot_patch_loss.item(),
+                ibot_patch_pos.item(),
+                ibot_patch_neg.item(),
+                self.ibot_neg_lambda,
+            )
             log_last_row_stats(
                 student_global["masked_patch_after_head"],
                 5,
@@ -763,12 +826,16 @@ class SSLMetaArch(nn.Module):
                 torch.softmax(student_global["masked_patch_after_head"][-1, :]/0.1, dim=0),
                 5,
                 "ibot_student_softmax",
+                num_width=11,
             )
             log_last_row_stats(
                 teacher_global["masked_patch_centered"][-1, :],
                 5,
                 "ibot_teacher_centered",
             )
+        loss_dict["ibot_pos"] = ibot_patch_pos
+        loss_dict["ibot_neg"] = ibot_patch_neg
+        loss_dict["ibot_neg_lambda"] = self.ibot_neg_lambda
         loss_dict["ibot_loss"] = ibot_patch_loss
         loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
