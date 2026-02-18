@@ -23,8 +23,8 @@ from .resize_paste import ResizePaste
 class AugmentSwitch:
     use_crop: bool = True
     crop_prob: float = 0.7
-    crop_roll_prob: float = 0.3
-    crop_split_prob: float = 0.5
+    crop_roll_prob: float = 0.0
+    crop_split_prob: float = 0.0
     crop_split_count_min: int = 2
     crop_split_count_max: int = 8
     crop_split_shuffle_prob: float = 0
