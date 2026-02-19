@@ -57,6 +57,7 @@ from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosi
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.new_train.train.ssl_meta_arch import SSLMetaArch
 from dinov3.new_train.train.ssl_resize_shuffle import SSLResizeShuffle
+from dinov3.new_train.train.warmup_history_cache import warmup_history_cache
 from dinov3.new_train.utils import get_device, synchronize
 
 logger = logging.getLogger("dinov3")
@@ -222,6 +223,8 @@ def build_schedulers(cfg):
         teacher_temp_schedule,
         last_layer_lr_schedule,
     )
+
+
 
 
 def build_schedulers_v2(cfg):
@@ -545,6 +548,7 @@ def do_train(cfg, model, resume=False):
         cfg,
         start_iter=start_iter
     )
+    data_iter = iter(data_loader)
 
     # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
@@ -553,6 +557,16 @@ def do_train(cfg, model, resume=False):
     # Manual garbage collection
     gc.disable()
     gc.collect()
+
+    # Warmup history cache before training (cache mode only)
+    data_iter = warmup_history_cache(
+        cfg,
+        model,
+        data_iter,
+        teacher_temp=teacher_temp_schedule[start_iter],
+        global_batch_size=global_batch_size,
+        start_iter=start_iter,
+    )
 
     # Training loop
     student = model.student
@@ -575,7 +589,7 @@ def do_train(cfg, model, resume=False):
     all_iteration_time = -1
     logger_freq = 20
     for data in metric_logger.log_every(
-        data_loader,
+        data_iter,
         print_freq=logger_freq,
         header="Training",
         n_iterations=max_iter,
