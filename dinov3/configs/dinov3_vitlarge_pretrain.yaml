@@ -15,9 +15,9 @@ dino:
   head_norm_last_layer: false
   head_nlayers: 3
   head_hidden_dim: 2048
-  koleo_cls_loss_weight: 0.5
-  koleo_patch_loss_weight: 0
-  koleo_cls_gate_enabled: false
+  koleo_cls_loss_weight: 0.1
+  koleo_patch_loss_weight: 0.1
+  koleo_cls_gate_enabled: true
   koleo_patch_gate_enabled: true
   koleo_cls_gate_threshold: 0.0
   koleo_patch_gate_threshold: 0.0
@@ -26,6 +26,8 @@ dino:
   koleo_distributed_replicas: 0
   koleo_distributed_loss_group_size: null
   force_weight_norm: false
+  neg_lambda: 0.5
+  neg_alpha: 1.0
 ibot:
   loss_weight: 1.0
   mask_sample_probability: 0.5
@@ -40,6 +42,8 @@ ibot:
   head_norm_last_layer: false
   head_nlayers: 3
   head_hidden_dim: 2048
+  neg_lambda: 0.5
+  neg_alpha: 1.0
 gram:
   use_loss: false
   compute_stats: false
@@ -187,14 +191,14 @@ data:
 resize_shuffle_augmentor:
   resize_paste_loss_weight:
     start: 0.0
-    peak: 0.25
-    end: 0.25
+    peak: 0.0
+    end: 0.0
     zero_epochs: 50
     warmup_epochs: 50
   patch_shuffle_loss_weight:
     start: 0.0
-    peak: 1.0
-    end: 1.0
+    peak: 0.0
+    end: 0.0
     zero_epochs: 50
     warmup_epochs: 50
   patch_shuffle_patch_weight: 0.25
@@ -206,18 +210,18 @@ resize_shuffle_augmentor:
   use_all_shift_mask: true
   bridge_patchshuffle_weight:
     start: 0.0
-    peak: 0.25
-    end: 0.25
-    zero_epochs: 100
+    peak: 0.0
+    end: 0.0
+    zero_epochs: 50
     warmup_epochs: 50
   bridge_global_weight:
     start: 0.0
-    peak: 0.25
-    end: 0.25
-    zero_epochs: 100
+    peak: 0.0
+    end: 0.0
+    zero_epochs: 50
     warmup_epochs: 50
   patch_size: 16
 dtch:
   enabled: true
-  patch_hist_cache: 40000
-  cls_hist_cache: 40000
+  patch_hist_cache: 50000
+  cls_hist_cache: 50000
